@@ -46,8 +46,9 @@
 **这就是 Windows 设置里的「图形性能首选项」，但直接搬进了工具里：**
 
 - 列出所有**正在运行的程序**（原生 API 枚举，毫秒级）
+- **实时显示每个程序在独显上的占用**（利用率 / 专属显存，与任务管理器同源，
+  走 Windows GPU Engine 性能计数器，正在使用独显的程序红色高亮并排在最前）
 - 选中程序 → 一键 **改用集显（省电）** / **改用独显（高性能）** / **恢复默认**
-- 显示每个程序当前的分配规则，以及**是否正在占用独显显存**
 - 支持**搜索**、**手动添加程序**（选择 exe）、**删除规则**、**结束进程**
 - 保存的规则随时可查看、修改
 
@@ -75,6 +76,8 @@
 ```bat
 GPU切换助手.exe --list                  :: 列出所有显示适配器
 GPU切换助手.exe --json                  :: JSON 格式输出
+GPU切换助手.exe --apps                  :: 列出运行中的程序与独显占用
+GPU切换助手.exe --dpiinfo               :: DPI 感知状态（诊断）
 GPU切换助手.exe --apply power           :: 切到节能模式（需管理员）
 GPU切换助手.exe --apply performance     :: 切到高性能模式
 GPU切换助手.exe --apply power --restart :: 切换后 5 秒重启
@@ -95,7 +98,10 @@ GPU切换助手.exe --apply power --restart :: 切换后 5 秒重启
 2. **启用/禁用**：`pnputil /enable-device` `/disable-device`（原生、快），
    失败时回退 PowerShell 的 `Enable-PnpDevice` / `Disable-PnpDevice`
 3. **应用 GPU 分配**：写注册表 `UserGpuPreferences`
-4. **监控/进程**：`nvidia-smi`
+4. **进程 GPU 占用检测**：DXGI 枚举适配器 LUID + 读取 Windows「GPU Engine」
+   性能计数器（任务管理器同一数据源，原生 PDH API，毫秒级），按实例名中的
+   pid / luid 精确归属到进程，再映射到显卡
+5. **监控**：`nvidia-smi`
 
 ---
 
@@ -107,6 +113,8 @@ GPU切换助手.exe --apply power --restart :: 切换后 5 秒重启
 3. 禁用独显期间 `nvidia-smi` 不可用，监控面板显示"独显不可用"属正常。
 4. 联想/华硕/戴尔等厂商管家可能自动重新启用独显。
 5. 首次运行被 SmartScreen 拦截时，点"更多信息 → 仍要运行"（未签名开源程序常见）。
+6. 完整支持高 DPI（150% / 200% 缩放）：程序声明 Per-Monitor V2 感知，
+   所有字体与布局按 DPI 实时缩放，高分屏下清晰不模糊。
 
 ---
 
