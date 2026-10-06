@@ -45,7 +45,6 @@ def main():
         "--noconfirm",
         "--onefile",
         "--windowed",
-        "--clean",
         "--name", NAME,
         "--distpath", DIST,
         "--workpath", os.path.join(HERE, "build"),
@@ -55,6 +54,10 @@ def main():
     ]
     if os.path.isfile(ICON):
         cmd += ["--icon", ICON]
+    manifest = os.path.join(HERE, "assets", "app.manifest")
+    if os.path.isfile(manifest):
+        # 声明 Per-Monitor V2 DPI 感知，避免高缩放屏上位图拉伸导致的界面模糊
+        cmd += ["--manifest", manifest]
     cmd += [ENTRY]
 
     r = subprocess.run(cmd, cwd=HERE)

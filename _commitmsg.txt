@@ -1,0 +1,9 @@
+fix: 修复打包后应用列表空白与高分屏模糊，重绘应用图标
+
+- 关键修复：显式 import ctypes.wintypes。打包后 ctypes.wintypes 属性不存在，
+  导致原生进程枚举抛异常被吞掉，「应用分配」页一直空白（源码运行时被间接触发加载，难以发现）
+- 界面模糊修复：assets/app.manifest 声明 PerMonitorV2 DPI 感知 + 运行时三级回退
+  （实测 exe 内 system DPI=192、tk scaling=2.67，文字恢复锐利）
+- 全新图标：macOS 风格渐变圆角底 + GPU 芯片，16~256px 分级细节
+- 枚举失败时给出可见提示并自动回退备用方案；新增 --apps / --dpiinfo 诊断参数
+- build.py 移除 --clean

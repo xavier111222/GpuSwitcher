@@ -11,6 +11,7 @@ GPU 切换助手 (GpuSwitcher)  —— 独立单文件版
 from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes  # noqa: F401  必须显式导入，打包后 ctypes.wintypes 属性才可用
 import json
 import math
 import os
@@ -1265,6 +1266,33 @@ def enum_processes():
     return out
 
 
+def enum_processes_ps():
+    """备用方案：用 PowerShell 枚举带路径的进程（较慢，仅在原生 API 失败时使用）"""
+    script = ("Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path } | "
+              "ForEach-Object { Write-Output ($_.Id.ToString() + '|' + $_.Path) }")
+    rc, out, err = run_ps(script, timeout=90)
+    if rc != 0 or not out:
+        return []
+    res = []
+    for line in out.splitlines():
+        if "|" not in line:
+            continue
+        pid, _, path = line.partition("|")
+        if pid.strip().isdigit() and path.strip():
+            res.append((int(pid.strip()), path.strip()))
+    return res
+
+
+def enum_processes_any():
+    procs = enum_processes()
+    if len(procs) >= 5:
+        return procs, "native"
+    fallback = enum_processes_ps()
+    if fallback:
+        return fallback, "fallback"
+    return procs, "native"
+
+
 def gpu_pref_all():
     """读取所有已保存的 GPU 偏好规则 {exe路径: 0/1/2}"""
     rules = {}
@@ -1809,20 +1837,25 @@ class App:
 
     def refresh_apps(self):
         def work():
-            procs = enum_processes()
-            dgpu = {}
             try:
-                for pid, _name, mem in gpu_processes():
-                    dgpu[str(pid)] = mem
+                procs, how = enum_processes_any()
+                dgpu = {}
+                try:
+                    for pid, _name, mem in gpu_processes():
+                        dgpu[str(pid)] = mem
+                except Exception:  # noqa: BLE001
+                    pass
+                rules = gpu_pref_all()
+                self.root.after(0, lambda: self._render_apps(procs, dgpu, rules, how))
             except Exception:  # noqa: BLE001
-                pass
-            rules = gpu_pref_all()
-            self.root.after(0, lambda: self._render_apps(procs, dgpu, rules))
+                err = traceback.format_exc(limit=3)
+                self.log("枚举进程失败：" + err, "error")
+                self.root.after(0, lambda: self._render_apps([], {}, {}, "error"))
 
         self.log("正在枚举进程 …")
         threading.Thread(target=work, daemon=True).start()
 
-    def _render_apps(self, procs, dgpu, rules):
+    def _render_apps(self, procs, dgpu, rules, how="native"):
         kw = self.search_var.get().strip().lower()
         merged = {}
         for pid, path in procs:
@@ -1852,13 +1885,17 @@ class App:
         self.proc_rows = rows
         for it in self.apptree.get_children():
             self.apptree.delete(it)
+        if not rows:
+            self.apptree.insert("", "end",
+                                values=("—", "未能枚举到进程，请点击「刷新」重试", "—", "—"))
         for _key, path, name, pref, mem, pids in rows:
             tag = "dgpu" if mem else ("igpu" if pref == 1 else "")
             self.apptree.insert("", "end", iid=path,
                                 values=(name, PREF_LABELS.get(pref, "默认"),
                                         mem or "—", path), tags=(tag,))
         self.refresh_rules()
-        self.log("已加载 %d 个进程，%d 条 GPU 分配规则。" % (len(rows), len(rules)))
+        self.log("已加载 %d 个进程（%s），%d 条 GPU 分配规则。"
+                 % (len(rows), "原生 API" if how == "native" else "备用方案", len(rules)))
 
     def refresh_rules(self):
         rules = gpu_pref_all()
@@ -2271,11 +2308,37 @@ def cli_main(argv):
     p = argparse.ArgumentParser(prog=APP_NAME, description="GPU 切换助手 命令行模式")
     p.add_argument("--list", action="store_true", help="列出显示适配器")
     p.add_argument("--json", action="store_true", help="以 JSON 输出")
+    p.add_argument("--apps", action="store_true", help="列出运行中的程序与 GPU 分配（诊断用）")
+    p.add_argument("--dpiinfo", action="store_true", help="显示 DPI 感知状态（诊断用）")
     p.add_argument("--apply", choices=["power", "performance"],
                    help="power=节能模式(禁用独显) / performance=高性能模式(启用独显)")
     p.add_argument("--silent", action="store_true", help="不弹窗")
     p.add_argument("--restart", action="store_true", help="应用后重启")
     a = p.parse_args(argv)
+
+    if a.dpiinfo:
+        mode = setup_dpi()
+        info = {"dpi_awareness": mode,
+                "system_dpi": get_system_dpi(),
+                "tk_scaling": None}
+        try:
+            r = tk.Tk()
+            info["tk_scaling"] = float(r.tk.call("tk", "scaling"))
+            info["window_dpi"] = get_window_dpi(r)
+            r.destroy()
+        except Exception as e:  # noqa: BLE001
+            info["tk_error"] = str(e)
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return 0
+
+    if a.apps:
+        procs = enum_processes()
+        print("枚举到 %d 个进程" % len(procs))
+        rules = gpu_pref_all()
+        print("GPU 分配规则 %d 条" % len(rules))
+        for pid, path in procs[:15]:
+            print("  %-7s %s  [规则:%s]" % (pid, path, PREF_SHORT.get(rules.get(path, 0), "默认")))
+        return 0 if procs else 1
 
     gpus = scan_gpus()
     if a.json or a.list:
@@ -2310,12 +2373,76 @@ def cli_main(argv):
     return 0
 
 
-def main():
-    # 高分屏适配
+# ============================================================ 高分屏（DPI）
+
+def setup_dpi() -> str:
+    """声明 DPI 感知，避免 Windows 对窗口做位图拉伸（那会导致界面模糊）。
+    必须在创建任何窗口之前调用。返回实际生效的感知模式。"""
+    # 1) Per-Monitor V2（Win10 1703+，最清晰）
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        fn = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        fn.restype = ctypes.c_bool
+        fn.argtypes = [ctypes.c_void_p]
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+        if fn(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2):
+            return "PerMonitorV2"
     except Exception:  # noqa: BLE001
         pass
+    # 2) Per-Monitor / System（Win8.1+）
+    try:
+        fn = ctypes.windll.shcore.SetProcessDpiAwareness
+        fn.restype = ctypes.c_long
+        fn.argtypes = [ctypes.c_long]
+        if fn(2) == 0:  # PER_MONITOR_AWARE
+            return "PerMonitor"
+        if fn(1) == 0:  # SYSTEM_AWARE
+            return "SystemAware"
+    except Exception:  # noqa: BLE001
+        pass
+    # 3) 兜底
+    try:
+        if ctypes.windll.user32.SetProcessDPIAware():
+            return "LegacyAware"
+    except Exception:  # noqa: BLE001
+        pass
+    return "Unaware"
+
+
+def get_system_dpi():
+    try:
+        return int(ctypes.windll.user32.GetDpiForSystem())
+    except Exception:  # noqa: BLE001
+        return 96
+
+
+def get_window_dpi(win):
+    try:
+        return int(ctypes.windll.user32.GetDpiForWindow(int(win.winfo_id())))
+    except Exception:  # noqa: BLE001
+        return get_system_dpi()
+
+
+def apply_tk_scaling(root):
+    """Tk 8.6 一般会自动按 DPI 放大字体；若仍是 96dpi 默认值则手动修正"""
+    want = get_system_dpi() / 72.0
+    try:
+        cur = float(root.tk.call("tk", "scaling"))
+    except Exception:  # noqa: BLE001
+        cur = 96 / 72.0
+    if abs(cur - want) > 0.05 and abs(cur - 96 / 72.0) < 0.05:
+        try:
+            root.tk.call("tk", "scaling", want)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return cur, float(root.tk.call("tk", "scaling"))
+    except Exception:  # noqa: BLE001
+        return cur, cur
+
+
+def main():
+    # 高分屏适配：必须在创建窗口之前
+    dpi_mode = setup_dpi()
 
     args = sys.argv[1:]
     # 只要出现 -- 开头的参数，就进入命令行模式（不启动界面）
@@ -2335,7 +2462,10 @@ def main():
         sys.__excepthook__(exc, value, tb)
 
     root.report_callback_exception = on_error
-    App(root)
+    _cur, _new = apply_tk_scaling(root)
+    app = App(root)
+    app.log("DPI 感知：%s · 系统 DPI：%d · Tk 缩放：%.2f→%.2f"
+            % (dpi_mode, get_system_dpi(), _cur, _new))
     root.mainloop()
 
 
