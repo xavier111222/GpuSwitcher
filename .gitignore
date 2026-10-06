@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.spec
+*.log
+*.egg-info/
+.idea/
+.vscode/
+诊断报告_*.txt
+恢复显卡（双击运行）.bat
