@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import re
 import shutil
@@ -469,6 +470,9 @@ def gpu_processes():
         pid = parts[0]
         name = parts[1] if len(parts) > 1 else ""
         mem = parts[2] if len(parts) > 2 else ""
+        # WDDM 模式下显存常显示 [N/A]（只是碰过独显，并非真正占用），过滤掉
+        if not mem or "N/A" in mem.upper():
+            continue
         result.append((pid, os.path.basename(name), mem))
     return result
 
@@ -701,287 +705,1042 @@ def fmt_bytes(n: float) -> str:
     return "%.1f MB" % (n / 1024 / 1024)
 
 
-# ============================================================ GUI
+# ============================================================ GUI（Apple 风格）
 
-PALETTE = {
-    "bg": "#f4f6f9",
-    "card": "#ffffff",
-    "text": "#1f2328",
-    "muted": "#656d76",
-    "border": "#d8dee4",
-    "accent": "#2f6feb",
-    "green": "#1a7f37",
-    "orange": "#bc4c00",
-    "red": "#cf222e",
+from tkinter import font as tkfont
+
+
+# ---------------------------------------------------------------- 主题
+
+THEME = {
+    "window": "#F5F5F7",
+    "sidebar": "#EFEFF2",
+    "card": "#FFFFFF",
+    "soft": "#FAFAFC",
+    "text": "#1D1D1F",
+    "text2": "#6E6E73",
+    "text3": "#86868B",
+    "sep": "#E8E8ED",
+    "border": "#D2D2D7",
+    "blue": "#007AFF",
+    "blue_h": "#0A84FF",
+    "blue_p": "#0060DF",
+    "green": "#34C759",
+    "orange": "#FF9500",
+    "red": "#FF3B30",
+    "track": "#E9E9EE",
+    "shadow": "#DEDEE3",
+    "disabled": "#C7C7CC",
 }
 
+UI_FONT = "Microsoft YaHei UI"
+MONO_FONT = "Consolas"
+
+
+def F(size=13, weight="normal", mono=False):
+    return ((MONO_FONT if mono else UI_FONT), size, weight)
+
+
+# ---------------------------------------------------------------- 圆角绘制
+
+def rrect_points(x1, y1, x2, y2, r, steps=14):
+    r = max(0.0, min(float(r), abs(x2 - x1) / 2.0, abs(y2 - y1) / 2.0))
+    pts = [x1 + r, y1]
+
+    def arc(cx, cy, a0, a1):
+        for i in range(steps + 1):
+            a = math.radians(a0 + (a1 - a0) * i / steps)
+            pts.append(cx + r * math.cos(a))
+            pts.append(cy + r * math.sin(a))
+
+    arc(x2 - r, y1 + r, -90, 0)
+    pts += [x2, y2 - r]
+    arc(x2 - r, y2 - r, 0, 90)
+    pts += [x1 + r, y2]
+    arc(x1 + r, y2 - r, 90, 180)
+    pts += [x1, y1 + r]
+    arc(x1 + r, y1 + r, 180, 270)
+    return pts
+
+
+def rrect(canvas, x1, y1, x2, y2, r, **kw):
+    kw.setdefault("outline", "")
+    return canvas.create_polygon(rrect_points(x1, y1, x2, y2, r), **kw)
+
+
+SHADOW_PAD = 5
+
+
+class RoundedFrame(tk.Canvas):
+    """圆角白色卡片，内部 .body 可自由摆放控件"""
+
+    def __init__(self, master, radius=16, fill=None, pad=16, bg=None, shadow=True):
+        bg = bg or THEME["window"]
+        fill = fill or THEME["card"]
+        tk.Canvas.__init__(self, master, bg=bg, highlightthickness=0, bd=0)
+        self.radius = radius
+        self.fill = fill
+        self.pad = pad
+        self.shadow = shadow
+        self._h = pad * 2 + SHADOW_PAD
+        self._last_w = -1
+        self.body = tk.Frame(self, bg=fill)
+        self._win = self.create_window(pad, pad, anchor="nw", window=self.body)
+        self.bind("<Configure>", self._on_size)
+        self.body.bind("<Configure>", self._on_inner)
+        self.configure(height=self._h)
+
+    def _on_size(self, event):
+        w = max(24, self.winfo_width())
+        if w != self._last_w:
+            self._last_w = w
+            self.itemconfigure(self._win, width=max(12, w - 2 * self.pad))
+        self._draw(w)
+
+    def _on_inner(self, event=None):
+        h = self.body.winfo_reqheight() + 2 * self.pad + SHADOW_PAD
+        if abs(h - self._h) > 0.5:
+            self._h = h
+            self.configure(height=h)
+            self._draw(self.winfo_width())
+
+    def _draw(self, w):
+        self.delete("card")
+        h = self._h
+        if w < 6 or h < 6:
+            return
+        if self.shadow:
+            rrect(self, 3, 4, w - 3, h - 1, self.radius + 1,
+                  fill=THEME["shadow"], tags="card")
+        rrect(self, 0, 0, w - 1, h - SHADOW_PAD - 1, self.radius,
+              fill=self.fill, outline=THEME["sep"], width=1, tags="card")
+
+
+# ---------------------------------------------------------------- 控件
+
+class AppleButton(tk.Canvas):
+    """圆角按钮：primary / secondary / danger / success / plain"""
+
+    STYLES = {
+        "primary": (THEME["blue"], THEME["blue_h"], THEME["blue_p"], "#FFFFFF"),
+        "secondary": ("#FFFFFF", "#F5F5F7", "#E5E5EA", THEME["text"]),
+        "danger": (THEME["red"], "#FF453A", "#D70015", "#FFFFFF"),
+        "success": (THEME["green"], "#30D158", "#248A3D", "#FFFFFF"),
+        "plain": (None, None, None, THEME["blue"]),
+    }
+
+    def __init__(self, master, text="", command=None, style="primary",
+                 width=150, height=40, radius=11, bg=None, font=None, state="normal"):
+        self.bg = bg if bg is not None else THEME["card"]
+        tk.Canvas.__init__(self, master, width=width, height=height,
+                           bg=self.bg, highlightthickness=0, bd=0)
+        self.text = text
+        self.command = command
+        self.style = style
+        self.width_ = width
+        self.height_ = height
+        self.radius = radius
+        self.font = font or F(11, "bold")
+        self.state = state
+        self._hover = False
+        self._press = False
+        self.bind("<Enter>", self._enter)
+        self.bind("<Leave>", self._leave)
+        self.bind("<ButtonPress-1>", self._down)
+        self.bind("<ButtonRelease-1>", self._up)
+        self.draw()
+
+    # -- 状态
+    def set_enabled(self, on: bool):
+        self.state = "normal" if on else "disabled"
+        self.configure(cursor="hand2" if on else "")
+        self.draw()
+
+    def set_text(self, t):
+        self.text = t
+        self.draw()
+
+    def _enter(self, _):
+        self._hover = True
+        self.configure(cursor="hand2" if self.state == "normal" else "")
+        self.draw()
+
+    def _leave(self, _):
+        self._hover = False
+        self._press = False
+        self.draw()
+
+    def _down(self, _):
+        if self.state != "normal":
+            return
+        self._press = True
+        self.draw()
+
+    def _up(self, _):
+        if self.state != "normal":
+            return
+        was = self._press
+        self._press = False
+        self.draw()
+        if was and self.command:
+            self.command()
+
+    def draw(self):
+        self.delete("all")
+        w, h, r = self.width_, self.height_, self.radius
+        base, hover, press, fg = self.STYLES.get(self.style, self.STYLES["primary"])
+        dis = self.state != "normal"
+
+        if dis:
+            fill, fg = THEME["disabled"], "#FFFFFF" if self.style != "secondary" else "#AEAEB2"
+            if self.style == "plain":
+                fill, fg = None, THEME["disabled"]
+        else:
+            fill = base
+            if self._press:
+                fill = press
+            elif self._hover:
+                fill = hover
+
+        if fill:
+            outline = THEME["border"] if self.style == "secondary" else ""
+            rrect(self, 1, 1, w - 2, h - 2, r, fill=fill, outline=outline, width=1)
+        elif self.style == "plain" and self._hover and not dis:
+            rrect(self, 1, 1, w - 2, h - 2, r, fill="#EFEFF2", outline="")
+
+        self.create_text(w / 2, h / 2, text=self.text, fill=fg, font=self.font)
+
+
+class SegmentedControl(tk.Canvas):
+    """iOS 风格分段控件（带滑动 thumb）"""
+
+    def __init__(self, master, options, command=None, width=340, height=38,
+                 bg=None, radius=10):
+        self.bg = bg or THEME["card"]
+        tk.Canvas.__init__(self, master, width=width, height=height,
+                           bg=self.bg, highlightthickness=0, bd=0)
+        self.options = list(options)
+        self.command = command
+        self.width_ = width
+        self.height_ = height
+        self.radius = radius
+        self.index = 0
+        self._shown = 0.0
+        self._anim = None
+        self.bind("<Button-1>", self._click)
+        self.configure(cursor="hand2")
+        self.draw()
+
+    def select(self, i, fire=False):
+        i = max(0, min(i, len(self.options) - 1))
+        if i == self.index and self._shown == float(i):
+            return
+        self.index = i
+        self._animate_to(float(i))
+        if fire and self.command:
+            self.command(i, self.options[i])
+
+    def _click(self, event):
+        n = len(self.options)
+        seg = self.width_ / float(n)
+        i = int(event.x // seg)
+        if 0 <= i < n and i != self.index:
+            self.select(i)
+            if self.command:
+                self.command(i, self.options[i])
+
+    def _animate_to(self, target):
+        if self._anim:
+            try:
+                self.after_cancel(self._anim)
+            except Exception:  # noqa: BLE001
+                pass
+        start = self._shown
+        steps = 8
+        self._step = 0
+
+        def tick():
+            self._step += 1
+            t = self._step / float(steps)
+            self._shown = start + (target - start) * t
+            self.draw()
+            if self._step < steps:
+                self._anim = self.after(16, tick)
+            else:
+                self._shown = target
+                self._anim = None
+                self.draw()
+
+        tick()
+
+    def draw(self):
+        self.delete("all")
+        w, h, n = self.width_, self.height_, len(self.options)
+        rrect(self, 0, 0, w - 1, h - 1, self.radius, fill=THEME["track"])
+        seg = w / float(n)
+        x = 3 + self._shown * seg
+        tw = seg - 6
+        rrect(self, x + 1, 5, x + tw + 1, h - 4, self.radius - 2,
+              fill=THEME["shadow"], outline="")
+        rrect(self, x, 3, x + tw, h - 6, self.radius - 2,
+              fill="#FFFFFF", outline=THEME["sep"], width=1)
+        for i, label in enumerate(self.options):
+            cx = seg * (i + 0.5)
+            self.create_text(cx, h / 2, text=label,
+                             fill=THEME["text"] if i == self.index else THEME["text2"],
+                             font=F(11, "bold" if i == self.index else "normal"))
+
+
+class ToggleSwitch(tk.Canvas):
+    """iOS 风格开关"""
+
+    def __init__(self, master, variable=None, command=None, bg=None,
+                 width=48, height=29):
+        self.bg = bg or THEME["card"]
+        tk.Canvas.__init__(self, master, width=width, height=height,
+                           bg=self.bg, highlightthickness=0, bd=0)
+        self.var = variable
+        self.command = command
+        self.width_, self.height_ = width, height
+        self._pos = 1.0 if (variable and variable.get()) else 0.0
+        self.bind("<Button-1>", self._click)
+        self.configure(cursor="hand2")
+        self.draw()
+
+    def _click(self, _):
+        if self.var is None:
+            return
+        self.var.set(not self.var.get())
+        self._animate()
+        if self.command:
+            self.command()
+
+    def _animate(self):
+        target = 1.0 if self.var.get() else 0.0
+        start, steps = self._pos, 8
+        self._i = 0
+
+        def tick():
+            self._i += 1
+            self._pos = start + (target - start) * (self._i / float(steps))
+            self.draw()
+            if self._i < steps:
+                self.after(16, tick)
+            else:
+                self._pos = target
+
+        tick()
+
+    def sync(self):
+        self._pos = 1.0 if (self.var and self.var.get()) else 0.0
+        self.draw()
+
+    def draw(self):
+        self.delete("all")
+        w, h = self.width_, self.height_
+        on = self._pos
+        r = h / 2.0
+        col = THEME["green"] if on > 0.5 else THEME["track"]
+        rrect(self, 0, 0, w - 1, h - 1, r, fill=col, outline="")
+        kx = 3 + on * (w - h + 3 - 3)
+        kd = h - 6
+        self.create_oval(kx + 1, 4, kx + kd + 1, 4 + kd,
+                         fill=THEME["shadow"], outline="")
+        self.create_oval(kx, 3, kx + kd, 3 + kd, fill="#FFFFFF", outline="")
+
+
+class Pill(tk.Canvas):
+    """小胶囊标签（状态徽章）"""
+
+    def __init__(self, master, text="", color=None, bg=None, size=11, pad=9, height=24):
+        self.bg = bg or THEME["window"]
+        self.color = color or THEME["blue"]
+        tk.Canvas.__init__(self, master, height=height, bg=self.bg,
+                           highlightthickness=0, bd=0)
+        self.text = text
+        self.size = size
+        self.pad = pad
+        self.height_ = height
+        self.redraw()
+
+    def set(self, text, color=None):
+        self.text = text
+        if color:
+            self.color = color
+        self.redraw()
+
+    def redraw(self):
+        self.delete("all")
+        f = tkfont.Font(family=UI_FONT, size=self.size, weight="bold")
+        w = f.measure(self.text) + self.pad * 2
+        self.configure(width=w)
+        rrect(self, 0, 0, w - 1, self.height_ - 1, self.height_ / 2.0, fill=self.color)
+        self.create_text(w / 2, self.height_ / 2 + 0.5, text=self.text,
+                         fill="#FFFFFF", font=(UI_FONT, self.size, "bold"))
+
+
+# ---------------------------------------------------------------- 侧边栏
+
+def draw_icon(c, kind, cx, cy, color, s=15):
+    if kind == "switch":
+        c.create_line(cx - s / 2, cy - 3.5, cx + s / 2 - 3, cy - 3.5, fill=color,
+                      width=1.7, arrow=tk.LAST, arrowshape=(5, 6, 3))
+        c.create_line(cx + s / 2, cy + 3.5, cx - s / 2 + 3, cy + 3.5, fill=color,
+                      width=1.7, arrow=tk.LAST, arrowshape=(5, 6, 3))
+    elif kind == "monitor":
+        base = cy + 6
+        for dx, hh in ((-6, 7), (-1.5, 12), (3, 5)):
+            c.create_rectangle(cx + dx, base - hh, cx + dx + 3, base,
+                               fill=color, outline="")
+    elif kind == "apps":
+        for i in range(3):
+            c.create_rectangle(cx - 7, cy - 6 + i * 5.5, cx + 7, cy - 3 + i * 5.5,
+                               fill=color, outline="")
+    elif kind == "tools":
+        c.create_oval(cx - 3.6, cy - 3.6, cx + 3.6, cy + 3.6, outline=color, width=1.5)
+        for a in range(0, 360, 45):
+            ar = math.radians(a)
+            c.create_line(cx + 5 * math.cos(ar), cy + 5 * math.sin(ar),
+                          cx + 7.5 * math.cos(ar), cy + 7.5 * math.sin(ar),
+                          fill=color, width=1.5)
+
+
+class Sidebar(tk.Canvas):
+    ROW_H = 40
+
+    def __init__(self, master, items, on_select, width=196):
+        tk.Canvas.__init__(self, master, width=width, bg=THEME["sidebar"],
+                           highlightthickness=0, bd=0)
+        self.items = items
+        self.on_select = on_select
+        self.index = 0
+        self.hover = None
+        self.width_ = width
+        self.bind("<Configure>", lambda e: self.draw())
+        self.bind("<Button-1>", self._click)
+        self.bind("<Motion>", self._motion)
+        self.bind("<Leave>", self._leave)
+
+    def _row_at(self, y):
+        i = int((y - self.top) // self.ROW_H)
+        return i if 0 <= i < len(self.items) else None
+
+    def _motion(self, e):
+        i = self._row_at(e.y)
+        if i != self.hover:
+            self.hover = i
+            self.draw()
+            self.configure(cursor="hand2" if i is not None else "")
+
+    def _leave(self, _):
+        if self.hover is not None:
+            self.hover = None
+            self.draw()
+
+    def _click(self, e):
+        i = self._row_at(e.y)
+        if i is not None and i != self.index:
+            self.index = i
+            self.draw()
+            self.on_select(i)
+
+    def draw(self):
+        self.delete("all")
+        w = self.width_
+        top = self.top = 96
+        # 应用标题
+        self.create_text(20, 34, anchor="w", text="GPU 切换助手",
+                         fill=THEME["text"], font=F(15, "bold"))
+        self.create_text(20, 58, anchor="w", text="NVIDIA 独显 / 集显 一键切换",
+                         fill=THEME["text3"], font=F(9))
+        self.create_line(14, 80, w - 14, 80, fill=THEME["border"])
+
+        pad = 12
+        for i, (icon, label) in enumerate(self.items):
+            y = top + i * self.ROW_H
+            x1, x2 = pad, w - pad
+            if i == self.index:
+                rrect(self, x1, y, x2, y + 34, 9, fill=THEME["blue"])
+                color = "#FFFFFF"
+            elif i == self.hover:
+                rrect(self, x1, y, x2, y + 34, 9, fill="#E3E3E8")
+                color = THEME["text"]
+            else:
+                color = THEME["text"]
+            draw_icon(self, icon, x1 + 18, y + 17, color)
+            self.create_text(x1 + 38, y + 17, anchor="w", text=label,
+                             fill=color, font=F(12, "bold" if i == self.index else "normal"))
+
+        # 底部权限徽章
+        self.create_text(20, self.winfo_height() - 26 if self.winfo_height() > 200 else 640,
+                         anchor="w", text="v" + APP_VERSION, fill=THEME["text3"], font=F(9))
+
+
+class ScrollFrame(tk.Frame):
+    def __init__(self, master, bg):
+        tk.Frame.__init__(self, master, bg=bg)
+        self.bg = bg
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.body = tk.Frame(self.canvas, bg=bg)
+        self._win = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self.canvas.bind("<Configure>",
+                         lambda e: self.canvas.itemconfigure(self._win, width=e.width))
+        self.body.bind("<Configure>",
+                       lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self._bind_wheel(self.canvas)
+        self._bind_wheel(self.body)
+
+    def _bind_wheel(self, w):
+        w.bind("<MouseWheel>", self._wheel)
+
+    def _wheel(self, e):
+        self.canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+    def bind_wheel_all(self):
+        for child in self.body.winfo_children():
+            self._recurse(child)
+
+    def _recurse(self, w):
+        try:
+            w.bind("<MouseWheel>", self._wheel)
+        except Exception:  # noqa: BLE001
+            pass
+        for c in w.winfo_children():
+            self._recurse(c)
+
+
+# ---------------------------------------------------------------- 进程与 GPU 偏好
+
+GPU_PREF_KEY = r"Software\Microsoft\DirectX\UserGpuPreferences"
+PREF_LABELS = {0: "让 Windows 决定", 1: "节能（集显）", 2: "高性能（独显）"}
+PREF_SHORT = {0: "默认", 1: "集显", 2: "独显"}
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def enum_processes():
+    """用原生 API 枚举进程及可执行文件路径，返回 [(pid, path), ...]"""
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    except Exception:  # noqa: BLE001
+        return []
+
+    psapi.EnumProcesses.argtypes = [ctypes.POINTER(ctypes.wintypes.DWORD),
+                                    ctypes.wintypes.DWORD,
+                                    ctypes.POINTER(ctypes.wintypes.DWORD)]
+    psapi.EnumProcesses.restype = ctypes.wintypes.BOOL
+    k32.OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL,
+                                ctypes.wintypes.DWORD]
+    k32.OpenProcess.restype = ctypes.wintypes.HANDLE
+    k32.QueryFullProcessImageNameW.argtypes = [ctypes.wintypes.HANDLE,
+                                               ctypes.wintypes.DWORD,
+                                               ctypes.c_wchar_p,
+                                               ctypes.POINTER(ctypes.wintypes.DWORD)]
+    k32.QueryFullProcessImageNameW.restype = ctypes.wintypes.BOOL
+
+    arr = (ctypes.wintypes.DWORD * 8192)()
+    needed = ctypes.wintypes.DWORD()
+    if not psapi.EnumProcesses(arr, ctypes.sizeof(arr),
+                               ctypes.byref(needed)):
+        return []
+    count = min(needed.value // ctypes.sizeof(ctypes.wintypes.DWORD), 8192)
+
+    out = []
+    for i in range(count):
+        pid = arr[i]
+        if pid <= 4:
+            continue
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            continue
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = ctypes.wintypes.DWORD(1024)
+            if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                out.append((pid, buf.value))
+        finally:
+            k32.CloseHandle(h)
+    return out
+
+
+def gpu_pref_all():
+    """读取所有已保存的 GPU 偏好规则 {exe路径: 0/1/2}"""
+    rules = {}
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, GPU_PREF_KEY)
+    except OSError:
+        return rules
+    try:
+        i = 0
+        while True:
+            try:
+                name, val, _ = winreg.EnumValue(k, i)
+                i += 1
+            except OSError:
+                break
+            m = re.search(r"GpuPreference\s*=\s*(\d+)", str(val))
+            rules[name] = int(m.group(1)) if m else 0
+    finally:
+        winreg.CloseKey(k)
+    return rules
+
+
+def gpu_pref_get(path):
+    return gpu_pref_all().get(path, 0)
+
+
+def gpu_pref_set(path, mode):
+    """设置某程序的 GPU 偏好：0 默认 / 1 节能(集显) / 2 高性能(独显)"""
+    if not path:
+        return False, "路径为空"
+    try:
+        k = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, GPU_PREF_KEY, 0,
+                               winreg.KEY_READ | winreg.KEY_WRITE)
+    except OSError as e:  # noqa: BLE001
+        return False, str(e)
+    try:
+        try:
+            old, _ = winreg.QueryValueEx(k, path)
+            old = str(old)
+        except OSError:
+            old = ""
+        parts = [p.strip() for p in old.split(";")
+                 if p.strip() and not p.strip().lower().startswith("gpupreference")]
+        if mode in (1, 2):
+            parts.insert(0, "GpuPreference=%d" % mode)
+        if parts:
+            value = "".join(p + ";" for p in parts)
+            winreg.SetValueEx(k, path, 0, winreg.REG_SZ, value)
+        else:
+            try:
+                winreg.DeleteValue(k, path)
+            except OSError:
+                winreg.SetValueEx(k, path, 0, winreg.REG_SZ, "")
+        return True, "ok"
+    except OSError as e:  # noqa: BLE001
+        return False, str(e)
+    finally:
+        winreg.CloseKey(k)
+
+
+def gpu_pref_remove(path):
+    return gpu_pref_set(path, 0)
+
+
+# ============================================================ 主界面
 
 class App:
+    PAGES = [("switch", "切换"), ("monitor", "监控"), ("apps", "应用分配"), ("tools", "更多工具")]
+
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.gpus: list[GpuDevice] = []
+        self.gpus = []
         self.busy = False
         self.stop_monitor = threading.Event()
         self.auto_restart = tk.BooleanVar(value=False)
         self.make_restore = tk.BooleanVar(value=False)
         self.auto_power_var = tk.BooleanVar(value=False)
         self.power_limit_var = tk.StringVar(value="")
+        self.search_var = tk.StringVar()
+        self.proc_rows = []
+        self.stat_vars = {}
 
         root.title("%s v%s" % (APP_NAME, APP_VERSION))
-        root.geometry("940x760")
-        root.minsize(860, 660)
-        root.configure(bg=PALETTE["bg"])
+        root.geometry("1040x760")
+        root.minsize(940, 660)
+        root.configure(bg=THEME["window"])
 
         self._style()
-        self._build_ui()
+        self._build()
 
-        self.log("程序已启动。目录: %s" % app_dir())
+        self.log("程序已启动 · %s" % app_dir())
         if is_admin():
             self.log("当前以管理员权限运行。", "ok")
-            self.admin_label.config(text="● 管理员", foreground=PALETTE["green"])
+            self.admin_pill.set("● 管理员", THEME["green"])
         else:
             self.log("当前为普通权限：切换显卡需要管理员权限。", "warn")
-            self.admin_label.config(text="● 普通权限", foreground=PALETTE["orange"])
-            self.elevate_btn.config(state="normal")
+            self.admin_pill.set("● 普通权限", THEME["orange"])
 
         self.refresh(initial=True)
+        self.refresh_apps()
         threading.Thread(target=self._monitor_loop, daemon=True).start()
 
-    # ---------------- 样式
+    # ---------------------------------------------------------- 样式
 
     def _style(self):
         s = ttk.Style()
         if "clam" in s.theme_names():
             s.theme_use("clam")
-        s.configure("TFrame", background=PALETTE["bg"])
-        s.configure("Card.TFrame", background=PALETTE["card"], relief="solid", borderwidth=1)
-        s.configure("TLabel", background=PALETTE["bg"], foreground=PALETTE["text"],
-                    font=("Microsoft YaHei UI", 10))
-        s.configure("Card.TLabel", background=PALETTE["card"])
-        s.configure("Title.TLabel", font=("Microsoft YaHei UI", 16, "bold"))
-        s.configure("Sub.TLabel", foreground=PALETTE["muted"],
-                    font=("Microsoft YaHei UI", 9))
-        s.configure("Mode.TLabel", font=("Microsoft YaHei UI", 13, "bold"))
-        s.configure("TNotebook", background=PALETTE["bg"])
-        s.configure("TNotebook.Tab", padding=(14, 6), font=("Microsoft YaHei UI", 10))
-        s.configure("Treeview", font=("Microsoft YaHei UI", 9), rowheight=26)
-        s.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
-        s.configure("TButton", font=("Microsoft YaHei UI", 10), padding=6)
-        s.configure("Action.TButton", font=("Microsoft YaHei UI", 10, "bold"), padding=8)
-        s.configure("TCheckbutton", background=PALETTE["card"])
+        s.configure("Apple.Treeview", background=THEME["card"],
+                    fieldbackground=THEME["card"], foreground=THEME["text"],
+                    borderwidth=0, relief="flat", rowheight=32, font=F(10),
+                    bordercolor=THEME["card"], lightcolor=THEME["card"],
+                    darkcolor=THEME["card"])
+        s.configure("Apple.Treeview.Heading", background=THEME["card"],
+                    foreground=THEME["text3"], borderwidth=0, relief="flat",
+                    font=F(9, "bold"))
+        s.map("Apple.Treeview",
+              background=[("selected", THEME["blue"])],
+              foreground=[("selected", "#FFFFFF")])
+        s.configure("Apple.Vertical.TScrollbar", background=THEME["window"],
+                    troughcolor=THEME["window"], borderwidth=0, arrowsize=12)
 
-    # ---------------- 界面
+    # ---------------------------------------------------------- 布局
 
-    def _build_ui(self):
-        top = ttk.Frame(self.root, padding=(16, 12, 16, 6))
-        top.pack(fill="x")
-        ttk.Label(top, text="GPU 切换助手", style="Title.TLabel").pack(side="left")
-        ttk.Label(top, text="  NVIDIA 独显 / 集显 一键切换", style="Sub.TLabel").pack(side="left", pady=(6, 0))
-        self.admin_label = ttk.Label(top, text="●", font=("Microsoft YaHei UI", 9, "bold"))
-        self.admin_label.pack(side="right", padx=8)
-        self.elevate_btn = ttk.Button(top, text="获取管理员权限", state="disabled",
-                                      command=self.on_elevate)
+    def _build(self):
+        main = tk.Frame(self.root, bg=THEME["window"])
+        main.pack(fill="both", expand=True)
+
+        self.sidebar = Sidebar(main, [(k, lbl) for k, lbl in self.PAGES],
+                               on_select=self.show_page)
+        self.sidebar.pack(side="left", fill="y")
+
+        right = tk.Frame(main, bg=THEME["window"])
+        right.pack(side="left", fill="both", expand=True)
+
+        # 顶部标题栏
+        head = tk.Frame(right, bg=THEME["window"])
+        head.pack(fill="x", padx=30, pady=(22, 10))
+        self.page_title = tk.Label(head, text="切换", bg=THEME["window"],
+                                   fg=THEME["text"], font=F(24, "bold"))
+        self.page_title.pack(side="left")
+        self.admin_pill = Pill(head, "● 检测中", THEME["text3"], bg=THEME["window"])
+        self.admin_pill.pack(side="right", padx=6)
+        self.elevate_btn = AppleButton(head, "获取管理员权限", command=self.on_elevate,
+                                       style="secondary", width=132, height=30, radius=9,
+                                       bg=THEME["window"], font=F(10))
         self.elevate_btn.pack(side="right")
+        if is_admin():
+            self.elevate_btn.pack_forget()
 
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill="both", expand=True, padx=14, pady=(4, 8))
+        # 页面容器
+        self.pages_box = tk.Frame(right, bg=THEME["window"])
+        self.pages_box.pack(fill="both", expand=True)
+        self.pages = {}
+        for key, _ in self.PAGES:
+            sc = ScrollFrame(self.pages_box, THEME["window"])
+            sc.grid(row=0, column=0, sticky="nsew")
+            self.pages[key] = sc
+        self.pages_box.grid_rowconfigure(0, weight=1)
+        self.pages_box.grid_columnconfigure(0, weight=1)
 
-        self._tab_switch(nb)
-        self._tab_monitor(nb)
-        self._tab_process(nb)
-        self._tab_tools(nb)
+        self._page_switch()
+        self._page_monitor()
+        self._page_apps()
+        self._page_tools()
+        for sc in self.pages.values():
+            sc.bind_wheel_all()
 
-        bottom = ttk.Frame(self.root, padding=(14, 0, 14, 10))
-        bottom.pack(fill="both", expand=False)
-        head = ttk.Frame(bottom)
-        head.pack(fill="x")
-        ttk.Label(head, text="操作日志", font=("Microsoft YaHei UI", 9, "bold")).pack(side="left")
-        ttk.Button(head, text="清空", width=6, command=self.clear_log).pack(side="right")
-        self.logbox = scrolledtext.ScrolledText(
-            bottom, height=9, font=("Consolas", 9), relief="solid", bd=1,
-            bg="#ffffff", fg=PALETTE["text"], wrap="word"
-        )
-        self.logbox.pack(fill="both", expand=True, pady=(4, 0))
-        for tag, color in (("ok", PALETTE["green"]), ("warn", PALETTE["orange"]),
-                           ("error", PALETTE["red"]), ("info", PALETTE["text"])):
+        self.show_page(0, silent=True)
+
+        # 底部日志
+        self._build_log(right)
+
+    def _card(self, parent, title=None, pad=18, radius=16):
+        c = RoundedFrame(parent, radius=radius, fill=THEME["card"], pad=pad)
+        c.pack(fill="x", padx=28, pady=(0, 12))
+        if title:
+            tk.Label(c.body, text=title, bg=THEME["card"], fg=THEME["text"],
+                     font=F(13, "bold")).pack(anchor="w", pady=(0, 12))
+        return c.body
+
+    def _build_log(self, parent):
+        box = tk.Frame(parent, bg=THEME["window"])
+        box.pack(fill="x", padx=28, pady=(4, 16))
+        card = RoundedFrame(box, radius=14, fill=THEME["card"], pad=12)
+        card.pack(fill="x")
+        top = tk.Frame(card.body, bg=THEME["card"])
+        top.pack(fill="x")
+        tk.Label(top, text="操作日志", bg=THEME["card"], fg=THEME["text"],
+                 font=F(11, "bold")).pack(side="left")
+        AppleButton(top, "清空", command=self.clear_log, style="plain",
+                    width=54, height=24, radius=7, bg=THEME["card"],
+                    font=F(9)).pack(side="right")
+        self.logbox = tk.Text(card.body, height=3, font=F(9, mono=True),
+                              relief="flat", bd=0, bg=THEME["card"],
+                              fg=THEME["text2"], highlightthickness=0, wrap="word")
+        self.logbox.pack(fill="x", pady=(8, 0))
+        for tag, color in (("ok", THEME["green"]), ("warn", THEME["orange"]),
+                           ("error", THEME["red"]), ("info", THEME["text2"])):
             self.logbox.tag_config(tag, foreground=color)
         self.logbox.configure(state="disabled")
 
-    def _card(self, parent, title=""):
-        outer = ttk.Frame(parent)
-        outer.pack(fill="x", padx=12, pady=8)
-        if title:
-            ttk.Label(outer, text=title, font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
-        inner = ttk.Frame(outer, style="Card.TFrame", padding=12)
-        inner.pack(fill="x", pady=(4, 0))
-        return inner
+    def show_page(self, i, silent=False):
+        key = self.PAGES[i][0]
+        self.pages[key].tkraise()
+        if not silent:
+            self.sidebar.index = i
+            self.sidebar.draw()
+        self.page_title.configure(text=self.PAGES[i][1])
 
-    def _tab_switch(self, nb):
-        tab = ttk.Frame(nb, padding=4)
-        nb.add(tab, text="  切换  ")
+    # ---------------------------------------------------------- 页面 1：切换
 
-        # 模式卡片
-        mode = self._card(tab, "当前模式")
-        self.mode_label = ttk.Label(mode, text="检测中 ...", style="Mode.TLabel")
+    def _page_switch(self):
+        p = self.pages["switch"].body
+        tk.Frame(p, bg=THEME["window"], height=4).pack()
+
+        hero = self._card(p)
+        self.mode_label = tk.Label(hero, text="检测中…", bg=THEME["card"],
+                                   fg=THEME["text"], font=F(18, "bold"))
         self.mode_label.pack(anchor="w")
-        self.mode_desc = ttk.Label(mode, text="", style="Card.TLabel",
-                                   foreground=PALETTE["muted"], wraplength=780,
-                                   font=("Microsoft YaHei UI", 9))
-        self.mode_desc.pack(anchor="w", pady=(2, 0))
+        self.mode_desc = tk.Label(hero, text="", bg=THEME["card"], fg=THEME["text2"],
+                                  font=F(10), justify="left", wraplength=620)
+        self.mode_desc.pack(anchor="w", pady=(6, 14))
+        self.seg = SegmentedControl(hero, ["🍃 节能（集显）", "⚡ 高性能（独显）"],
+                                    command=self.on_segment, width=330, height=38,
+                                    bg=THEME["card"])
+        self.seg.pack(side="left", anchor="s", pady=(6, 0))
 
-        # 显卡列表
-        box = self._card(tab, "显示适配器")
+        opts = tk.Frame(hero, bg=THEME["card"])
+        opts.pack(side="right", anchor="s", pady=(0, 2))
+        r1 = tk.Frame(opts, bg=THEME["card"])
+        r1.pack(fill="x", pady=2)
+        tk.Label(r1, text="操作前创建还原点", bg=THEME["card"], fg=THEME["text2"],
+                 font=F(10)).pack(side="left", padx=(0, 8))
+        ToggleSwitch(r1, variable=self.make_restore, bg=THEME["card"]).pack(side="right")
+        r2 = tk.Frame(opts, bg=THEME["card"])
+        r2.pack(fill="x", pady=(8, 2))
+        tk.Label(r2, text="切换后自动重启", bg=THEME["card"], fg=THEME["text2"],
+                 font=F(10)).pack(side="left", padx=(0, 8))
+        ToggleSwitch(r2, variable=self.auto_restart, bg=THEME["card"]).pack(side="right")
+
+        box = self._card(p, "显示适配器")
         cols = ("name", "vendor", "kind", "status", "driver", "vram")
-        self.tree = ttk.Treeview(box, columns=cols, show="headings", height=5)
-        heads = {"name": "设备名称", "vendor": "厂商", "kind": "类型",
-                 "status": "状态", "driver": "驱动版本", "vram": "显存"}
-        widths = {"name": 300, "vendor": 80, "kind": 60, "status": 70, "driver": 110, "vram": 70}
-        for c in cols:
-            self.tree.heading(c, text=heads[c])
-            self.tree.column(c, width=widths[c], anchor="w")
+        self.tree = ttk.Treeview(box, columns=cols, show="headings", height=4,
+                                 style="Apple.Treeview")
+        for c, t, w in (("name", "设备", 250), ("vendor", "厂商", 80),
+                        ("kind", "类型", 60), ("status", "状态", 70),
+                        ("driver", "驱动版本", 110), ("vram", "显存", 70)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor="w")
         self.tree.pack(fill="x")
-        self.tree.tag_configure("disabled", foreground=PALETTE["muted"])
+        self.tree.tag_configure("disabled", foreground=THEME["text3"])
         self.tree.bind("<Button-3>", self._on_tree_menu)
 
-        btnrow = ttk.Frame(box)
-        btnrow.pack(fill="x", pady=(8, 0))
-        ttk.Button(btnrow, text="刷新状态", command=lambda: self.refresh(False)).pack(side="left")
-        ttk.Button(btnrow, text="启用选中设备", command=self._enable_selected).pack(side="left", padx=6)
-        ttk.Button(btnrow, text="禁用选中设备", command=self._disable_selected).pack(side="left")
+        row = tk.Frame(box, bg=THEME["card"])
+        row.pack(fill="x", pady=(12, 0))
+        AppleButton(row, "刷新", command=lambda: self.refresh(False), style="secondary",
+                    width=88, height=32, radius=9, font=F(10)).pack(side="left")
+        AppleButton(row, "启用选中", command=self._enable_selected, style="secondary",
+                    width=88, height=32, radius=9, font=F(10)).pack(side="left", padx=8)
+        AppleButton(row, "禁用选中", command=self._disable_selected, style="secondary",
+                    width=88, height=32, radius=9, font=F(10)).pack(side="left")
 
-        # 一键操作
-        acts = self._card(tab, "一键操作")
-        grid = ttk.Frame(acts, style="Card.TFrame")
-        grid.pack(fill="x")
-        self.btn_power = ttk.Button(grid, text="🍃  节能模式（关闭独显，用集显）",
-                                    style="Action.TButton", command=self.on_power_saving)
-        self.btn_power.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=3)
-        self.btn_perf = ttk.Button(grid, text="⚡  高性能模式（启用独显）",
-                                   style="Action.TButton", command=self.on_performance)
-        self.btn_perf.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=3)
-        self.btn_restart = ttk.Button(grid, text="🔄  重启电脑（释放独显）",
-                                      command=self.on_restart)
-        self.btn_restart.grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=3)
-        self.btn_logoff = ttk.Button(grid, text="🚪  注销（温和释放独显）",
-                                     command=self.on_logoff)
-        self.btn_logoff.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=3)
-        grid.columnconfigure(0, weight=1)
-        grid.columnconfigure(1, weight=1)
+        act = self._card(p, "电源动作")
+        row2 = tk.Frame(act, bg=THEME["card"])
+        row2.pack(fill="x")
+        self.btn_restart = AppleButton(row2, "🔄  重启", command=self.on_restart,
+                                       style="secondary", width=118, height=36, font=F(10))
+        self.btn_restart.pack(side="left")
+        self.btn_logoff = AppleButton(row2, "🚪  注销（温和释放独显）", command=self.on_logoff,
+                                      style="secondary", width=200, height=36, font=F(10))
+        self.btn_logoff.pack(side="left", padx=10)
+        AppleButton(row2, "🌙  睡眠", command=lambda: self._run(self._sleep),
+                    style="secondary", width=104, height=36, font=F(10)).pack(side="left")
+        AppleButton(row2, "⏻  关机", command=self.on_shutdown,
+                    style="secondary", width=104, height=36, font=F(10)).pack(side="left", padx=10)
 
-        opts = ttk.Frame(acts, style="Card.TFrame")
-        opts.pack(fill="x", pady=(10, 0))
-        ttk.Checkbutton(opts, text="切换后自动重启（立即生效）",
-                        variable=self.auto_restart, style="TCheckbutton").pack(side="left")
-        ttk.Checkbutton(opts, text="操作前创建系统还原点",
-                        variable=self.make_restore, style="TCheckbutton").pack(side="left", padx=18)
+    def on_segment(self, index, _label):
+        if index == 0:
+            self.on_power_saving()
+        else:
+            self.on_performance()
 
-    def _tab_monitor(self, nb):
-        tab = ttk.Frame(nb, padding=4)
-        nb.add(tab, text="  监控  ")
-        box = self._card(tab, "独显实时状态（每 2 秒刷新）")
-        self.stat_vars = {}
+    # ---------------------------------------------------------- 页面 2：监控
+
+    def _page_monitor(self):
+        p = self.pages["monitor"].body
+        tk.Frame(p, bg=THEME["window"], height=4).pack()
+
+        box = self._card(p)
+        head = tk.Frame(box, bg=THEME["card"])
+        head.pack(fill="x")
+        tk.Label(head, text="独显实时状态", bg=THEME["card"], fg=THEME["text"],
+                 font=F(13, "bold")).pack(side="left")
+        self.monitor_pill = Pill(head, "每 2 秒刷新", THEME["blue"], bg=THEME["card"], size=9)
+        self.monitor_pill.pack(side="right")
+
+        grid = tk.Frame(box, bg=THEME["card"])
+        grid.pack(fill="x", pady=(12, 0))
         rows = [("显卡", "name"), ("温度", "temp"), ("利用率", "util"),
                 ("显存占用", "mem"), ("功耗", "power"), ("功耗上限", "plimit")]
         for i, (label, key) in enumerate(rows):
-            ttk.Label(box, text=label + "：", style="Card.TLabel",
-                      font=("Microsoft YaHei UI", 10)).grid(row=i, column=0, sticky="w", pady=4)
-            v = tk.StringVar(value="-")
+            r, c = divmod(i, 3)
+            tile = tk.Frame(grid, bg=THEME["soft"], highlightthickness=1,
+                            highlightbackground=THEME["sep"], highlightcolor=THEME["sep"])
+            tile.grid(row=r, column=c, sticky="nsew", padx=6, pady=6)
+            grid.grid_columnconfigure(c, weight=1)
+            v = tk.StringVar(value="—")
             self.stat_vars[key] = v
-            ttk.Label(box, textvariable=v, style="Card.TLabel",
-                      font=("Consolas", 11, "bold")).grid(row=i, column=1, sticky="w", pady=4)
-        self.smi_note = ttk.Label(box, text="", style="Card.TLabel",
-                                  foreground=PALETTE["muted"],
-                                  font=("Microsoft YaHei UI", 9))
-        self.smi_note.grid(row=len(rows), column=0, columnspan=2, sticky="w", pady=(8, 0))
+            tk.Label(tile, text=label, bg=THEME["soft"], fg=THEME["text3"],
+                     font=F(9)).pack(anchor="w", padx=12, pady=(10, 0))
+            tk.Label(tile, textvariable=v, bg=THEME["soft"], fg=THEME["text"],
+                     font=F(13, "bold"), wraplength=190,
+                     justify="left").pack(anchor="w", padx=12, pady=(2, 12))
+        self.smi_note = tk.Label(box, text="", bg=THEME["card"], fg=THEME["text3"],
+                                 font=F(9))
+        self.smi_note.pack(anchor="w", pady=(6, 0))
         if not find_nvidia_smi():
-            self.smi_note.config(text="未找到 nvidia-smi，监控不可用（独显被禁用时也会不可用）。")
+            self.smi_note.configure(text="未找到 nvidia-smi，监控不可用（独显被禁用时同样不可用）。")
 
-        tools = self._card(tab, "其他系统入口")
-        f = ttk.Frame(tools, style="Card.TFrame")
-        f.pack(fill="x")
-        ttk.Button(f, text="Windows 图形性能首选项",
-                   command=lambda: open_uri("ms-settings:display-advancedgraphics")).pack(side="left")
-        ttk.Button(f, text="NVIDIA 控制面板",
-                   command=lambda: self._run(self._open_nv)).pack(side="left", padx=6)
-        ttk.Button(f, text="设备管理器",
-                   command=lambda: open_uri("devmgmt.msc")).pack(side="left")
+        box2 = self._card(p, "系统入口")
+        row = tk.Frame(box2, bg=THEME["card"])
+        row.pack(fill="x")
+        AppleButton(row, "Windows 图形性能首选项",
+                    command=lambda: open_uri("ms-settings:display-advancedgraphics"),
+                    style="secondary", width=210, height=36, font=F(10)).pack(side="left")
+        AppleButton(row, "NVIDIA 控制面板", command=lambda: self._run(self._open_nv),
+                    style="secondary", width=140, height=36, font=F(10)).pack(side="left", padx=10)
+        AppleButton(row, "设备管理器", command=lambda: open_uri("devmgmt.msc"),
+                    style="secondary", width=110, height=36, font=F(10)).pack(side="left")
 
-    def _tab_process(self, nb):
-        tab = ttk.Frame(nb, padding=4)
-        nb.add(tab, text="  占用进程  ")
-        box = self._card(tab, "正在占用独显的进程")
-        cols = ("pid", "name", "mem")
-        self.ptree = ttk.Treeview(box, columns=cols, show="headings", height=9)
-        for c, t, w in (("pid", "PID", 90), ("name", "进程", 320), ("mem", "显存占用", 120)):
-            self.ptree.heading(c, text=t)
-            self.ptree.column(c, width=w, anchor="w")
-        self.ptree.pack(fill="x")
-        row = ttk.Frame(box, style="Card.TFrame")
-        row.pack(fill="x", pady=(8, 0))
-        ttk.Button(row, text="刷新列表", command=self.refresh_processes).pack(side="left")
-        ttk.Button(row, text="结束选中进程", command=self.kill_process).pack(side="left", padx=6)
-        ttk.Label(row, text="结束进程可释放被占用的独显，从而切换到集显。",
-                  style="Card.TLabel", foreground=PALETTE["muted"],
-                  font=("Microsoft YaHei UI", 9)).pack(side="left", padx=6)
-        self.refresh_processes()
+    # ---------------------------------------------------------- 页面 3：应用 GPU 分配
 
-    def _tab_tools(self, nb):
-        tab = ttk.Frame(nb, padding=4)
-        nb.add(tab, text="  更多工具  ")
+    def _page_apps(self):
+        p = self.pages["apps"].body
+        tk.Frame(p, bg=THEME["window"], height=4).pack()
 
-        box = self._card(tab, "省电与功耗")
-        r = ttk.Frame(box, style="Card.TFrame")
+        tip = self._card(p)
+        tk.Label(tip, text="为每个程序单独指定用哪块显卡", bg=THEME["card"],
+                 fg=THEME["text"], font=F(13, "bold")).pack(anchor="w")
+        tk.Label(tip,
+                 text="Windows 原生支持按程序分配 GPU。下面列出正在运行的程序，"
+                      "选中后点按钮即可指定：\n"
+                      "「集显」= 省电模式，程序改用集成显卡；「独显」= 高性能，"
+                      "程序使用 NVIDIA 显卡。设置后需重启该程序生效。",
+                 bg=THEME["card"], fg=THEME["text2"], font=F(10),
+                 justify="left", wraplength=640).pack(anchor="w", pady=(6, 0))
+
+        box = self._card(p, "运行中的程序")
+        filt = tk.Frame(box, bg=THEME["card"])
+        filt.pack(fill="x", pady=(0, 10))
+        e = tk.Entry(filt, textvariable=self.search_var, relief="solid", bd=1,
+                     highlightthickness=1, highlightcolor=THEME["blue"],
+                     highlightbackground=THEME["border"], font=F(10), width=30)
+        e.pack(side="left", ipady=4)
+        e.bind("<Return>", lambda _e: self.refresh_apps())
+        AppleButton(filt, "搜索", command=self.refresh_apps, style="secondary",
+                    width=72, height=30, radius=9, font=F(10)).pack(side="left", padx=8)
+        AppleButton(filt, "刷新", command=self.refresh_apps, style="secondary",
+                    width=72, height=30, radius=9, font=F(10)).pack(side="left")
+
+        cols = ("name", "pref", "dgpu", "path")
+        self.apptree = ttk.Treeview(box, columns=cols, show="headings", height=11,
+                                    style="Apple.Treeview")
+        for c, t, w in (("name", "程序", 150), ("pref", "GPU 分配", 110),
+                        ("dgpu", "独显占用", 90), ("path", "路径", 300)):
+            self.apptree.heading(c, text=t)
+            self.apptree.column(c, width=w, anchor="w")
+        self.apptree.pack(fill="x")
+        self.apptree.tag_configure("dgpu", foreground=THEME["red"])
+        self.apptree.tag_configure("igpu", foreground=THEME["green"])
+
+        row = tk.Frame(box, bg=THEME["card"])
+        row.pack(fill="x", pady=(12, 0))
+        AppleButton(row, "🍃 改用集显（省电）", command=lambda: self.set_app_pref(1),
+                    style="success", width=170, height=36, font=F(10)).pack(side="left")
+        AppleButton(row, "⚡ 改用独显（高性能）", command=lambda: self.set_app_pref(2),
+                    style="primary", width=180, height=36, font=F(10)).pack(side="left", padx=10)
+        AppleButton(row, "恢复默认", command=lambda: self.set_app_pref(0),
+                    style="secondary", width=100, height=36, font=F(10)).pack(side="left")
+
+        row2 = tk.Frame(box, bg=THEME["card"])
+        row2.pack(fill="x", pady=(10, 0))
+        AppleButton(row2, "结束选中进程", command=self.kill_app, style="danger",
+                    width=130, height=34, font=F(10)).pack(side="left")
+        AppleButton(row2, "手动添加程序…", command=self.add_app, style="secondary",
+                    width=150, height=34, font=F(10)).pack(side="left", padx=10)
+        AppleButton(row2, "打开 Windows 设置",
+                    command=lambda: open_uri("ms-settings:display-advancedgraphics"),
+                    style="secondary", width=170, height=34, font=F(10)).pack(side="left")
+
+        box3 = self._card(p, "已保存的规则")
+        self.ruletree = ttk.Treeview(box3, columns=("path", "rule"), show="headings",
+                                     height=5, style="Apple.Treeview")
+        self.ruletree.heading("path", text="程序")
+        self.ruletree.heading("rule", text="分配")
+        self.ruletree.column("path", width=430, anchor="w")
+        self.ruletree.column("rule", width=120, anchor="w")
+        self.ruletree.pack(fill="x")
+        r3 = tk.Frame(box3, bg=THEME["card"])
+        r3.pack(fill="x", pady=(12, 0))
+        AppleButton(r3, "刷新规则", command=self.refresh_rules, style="secondary",
+                    width=100, height=32, radius=9, font=F(10)).pack(side="left")
+        AppleButton(r3, "删除选中规则", command=self.remove_rule, style="secondary",
+                    width=120, height=32, radius=9, font=F(10)).pack(side="left", padx=10)
+
+    # ---------------------------------------------------------- 页面 4：更多工具
+
+    def _page_tools(self):
+        p = self.pages["tools"].body
+        tk.Frame(p, bg=THEME["window"], height=4).pack()
+
+        box = self._card(p, "功耗上限")
+        row = tk.Frame(box, bg=THEME["card"])
+        row.pack(fill="x")
+        tk.Label(row, text="限制独显功耗 (W)", bg=THEME["card"], fg=THEME["text"],
+                 font=F(11)).pack(side="left")
+        sp = tk.Spinbox(row, from_=10, to=400, width=7, font=F(11),
+                        textvariable=self.power_limit_var, relief="solid", bd=1,
+                        highlightthickness=1, highlightbackground=THEME["border"])
+        sp.pack(side="left", padx=10)
+        AppleButton(row, "读取当前", command=lambda: self.read_power(False),
+                    style="secondary", width=96, height=32, radius=9, font=F(10)).pack(side="left")
+        AppleButton(row, "应用", command=self.apply_power, style="primary",
+                    width=76, height=32, radius=9, font=F(10)).pack(side="left", padx=8)
+        tk.Label(box, text="需管理员权限；多数笔记本的功耗由固件锁定，可能不支持。",
+                 bg=THEME["card"], fg=THEME["text3"], font=F(9)).pack(anchor="w", pady=(10, 0))
+
+        box2 = self._card(p, "开机自动化")
+        r = tk.Frame(box2, bg=THEME["card"])
         r.pack(fill="x")
-        ttk.Label(r, text="功耗上限 (W)：", style="Card.TLabel").pack(side="left")
-        self.plim_spin = ttk.Spinbox(r, from_=10, to=400, width=8,
-                                     textvariable=self.power_limit_var)
-        self.plim_spin.pack(side="left", padx=4)
-        ttk.Button(r, text="读取当前", command=self.read_power).pack(side="left", padx=6)
-        ttk.Button(r, text="应用", command=self.apply_power).pack(side="left")
-        ttk.Label(r, text="需管理员权限，笔记本机型可能不支持。", style="Card.TLabel",
-                  foreground=PALETTE["muted"], font=("Microsoft YaHei UI", 9)).pack(side="left", padx=8)
+        tk.Label(r, text="登录后自动关闭独显（节能模式）", bg=THEME["card"],
+                 fg=THEME["text"], font=F(11)).pack(side="left")
+        ToggleSwitch(r, variable=self.auto_power_var, command=self.toggle_autostart,
+                     bg=THEME["card"]).pack(side="right")
 
-        box2 = self._card(tab, "开机自动化")
-        r2 = ttk.Frame(box2, style="Card.TFrame")
-        r2.pack(fill="x")
-        ttk.Checkbutton(r2, text="登录后自动应用节能模式（关闭独显）",
-                        variable=self.auto_power_var, style="TCheckbutton",
-                        command=self.toggle_autostart).pack(side="left")
-
-        box3 = self._card(tab, "维护与应急")
-        r3 = ttk.Frame(box3, style="Card.TFrame")
+        box3 = self._card(p, "维护与应急")
+        r3 = tk.Frame(box3, bg=THEME["card"])
         r3.pack(fill="x")
-        ttk.Button(r3, text="创建系统还原点",
-                   command=lambda: self._run(self._restore_point)).pack(side="left")
-        ttk.Button(r3, text="清理着色器缓存",
-                   command=self.clear_cache).pack(side="left", padx=6)
-        ttk.Button(r3, text="生成诊断报告",
-                   command=self.make_report).pack(side="left", padx=6)
-        ttk.Button(r3, text="生成恢复脚本",
-                   command=self.make_recovery).pack(side="left")
+        AppleButton(r3, "创建系统还原点", command=lambda: self._run(self._restore_point),
+                    style="secondary", width=140, height=34, font=F(10)).pack(side="left")
+        AppleButton(r3, "清理着色器缓存", command=self.clear_cache,
+                    style="secondary", width=140, height=34, font=F(10)).pack(side="left", padx=10)
+        AppleButton(r3, "生成诊断报告", command=self.make_report,
+                    style="secondary", width=130, height=34, font=F(10)).pack(side="left")
+        AppleButton(r3, "生成恢复脚本", command=self.make_recovery,
+                    style="secondary", width=130, height=34, font=F(10)).pack(side="left", padx=10)
 
-        box4 = self._card(tab, "电源动作")
-        r4 = ttk.Frame(box4, style="Card.TFrame")
+        box4 = self._card(p, "电源动作")
+        r4 = tk.Frame(box4, bg=THEME["card"])
         r4.pack(fill="x")
-        ttk.Button(r4, text="重启", command=self.on_restart).pack(side="left")
-        ttk.Button(r4, text="注销", command=self.on_logoff).pack(side="left", padx=6)
-        ttk.Button(r4, text="睡眠", command=lambda: self._run(self._sleep)).pack(side="left")
-        ttk.Button(r4, text="关机", command=self.on_shutdown).pack(side="left", padx=6)
-        ttk.Button(r4, text="打开电源设置",
-                   command=lambda: open_uri("ms-settings:powersleep")).pack(side="left", padx=6)
+        AppleButton(r4, "重启", command=self.on_restart, style="secondary",
+                    width=90, height=34, font=F(10)).pack(side="left")
+        AppleButton(r4, "注销", command=self.on_logoff, style="secondary",
+                    width=90, height=34, font=F(10)).pack(side="left", padx=10)
+        AppleButton(r4, "睡眠", command=lambda: self._run(self._sleep),
+                    style="secondary", width=90, height=34, font=F(10)).pack(side="left")
+        AppleButton(r4, "关机", command=self.on_shutdown, style="secondary",
+                    width=90, height=34, font=F(10)).pack(side="left", padx=10)
+        AppleButton(r4, "电源设置", command=lambda: open_uri("ms-settings:powersleep"),
+                    style="secondary", width=100, height=34, font=F(10)).pack(side="left")
 
-        box5 = self._card(tab, "关于")
-        ttk.Label(box5,
-                  text="%s v%s  ·  MIT 开源协议\n"
-                       "原理：通过 Windows 即插即用接口启用/禁用 NVIDIA 显示适配器。\n"
-                       "切换显卡不会损坏硬件；若出现黑屏，可重启进入安全模式，或用「恢复显卡」脚本重新启用。"
-                       % (APP_NAME, APP_VERSION),
-                  style="Card.TLabel", foreground=PALETTE["muted"],
-                  font=("Microsoft YaHei UI", 9), justify="left").pack(anchor="w")
+        box5 = self._card(p, "关于")
+        tk.Label(box5,
+                 text="%s v%s · MIT 开源协议\n"
+                      "原理：通过 Windows 即插即用接口启用/禁用 NVIDIA 显示适配器；\n"
+                      "应用分配：写入 Windows 原生的「图形性能首选项」"
+                      "(HKCU\\Software\\Microsoft\\DirectX\\UserGpuPreferences)。\n"
+                      "若出现黑屏，可重启进入安全模式，或用「恢复显卡」脚本重新启用。"
+                 % (APP_NAME, APP_VERSION),
+                 bg=THEME["card"], fg=THEME["text2"], font=F(10),
+                 justify="left").pack(anchor="w")
 
         self.auto_power_var.set(autostart_enabled())
 
-    # ---------------- 日志
+    # ---------------------------------------------------------- 日志
 
     def log(self, msg: str, level: str = "info"):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1005,11 +1764,11 @@ class App:
         self.logbox.delete("1.0", "end")
         self.logbox.configure(state="disabled")
 
-    # ---------------- 数据刷新
+    # ---------------------------------------------------------- 刷新
 
     def refresh(self, initial=False):
         def work():
-            gpus = scan_gpus(emit=None)
+            gpus = scan_gpus()
             self.root.after(0, lambda: self._render_gpus(gpus, initial))
 
         threading.Thread(target=work, daemon=True).start()
@@ -1018,36 +1777,296 @@ class App:
         self.gpus = gpus
         for item in self.tree.get_children():
             self.tree.delete(item)
-        for g in gpus:
-            tags = ("disabled",) if not g.enabled else ()
+        order = sorted(gpus, key=lambda g: (g.kind != "独显", g.vendor != "NVIDIA"))
+        for g in order:
             self.tree.insert("", "end", iid=g.instance_id,
                              values=(g.name, g.vendor, g.kind, g.status_text,
                                      g.driver or "-", g.vram_text),
-                             tags=tags)
+                             tags=("disabled",) if not g.enabled else ())
 
         d = pick_discrete(gpus)
         i = pick_integrated(gpus)
         if d and any(g.enabled for g in d):
-            self.mode_label.config(text="⚡ 高性能模式（独显工作中）", foreground=PALETTE["accent"])
-            names = "、".join(g.name for g in d)
-            self.mode_desc.config(
-                text="独显：%s。适合游戏、渲染、AI 计算；功耗较高。\n"
-                     "切换到节能模式会禁用独显，屏幕改由集显（如存在）输出。" % names)
+            self.mode_label.configure(text="⚡ 高性能模式", fg=THEME["blue"])
+            desc = "独显 %s 正在工作，适合游戏、渲染与 AI 计算，功耗较高。" \
+                   % "、".join(g.name for g in d)
+            self.seg.select(1)
         elif d:
-            self.mode_label.config(text="🍃 节能模式（独显已关闭）", foreground=PALETTE["green"])
-            self.mode_desc.config(
-                text="所有 NVIDIA 独显均已被禁用，系统由集显承担显示输出，续航更长、发热更低。")
+            self.mode_label.configure(text="🍃 节能模式", fg=THEME["green"])
+            desc = "NVIDIA 独显已关闭，系统由集显承担显示输出，续航更长、发热更低。"
+            self.seg.select(0)
         else:
-            self.mode_label.config(text="未检测到 NVIDIA 独显", foreground=PALETTE["muted"])
-            self.mode_desc.config(text="未在系统里找到 NVIDIA 显示适配器，可能已被禁用或不存在。")
-
+            self.mode_label.configure(text="未检测到 NVIDIA 独显", fg=THEME["text3"])
+            desc = "系统里没有找到 NVIDIA 显示适配器，可能已被禁用或不存在。"
         if not i and d:
-            self.mode_desc.config(
-                text=self.mode_desc.cget("text") + "\n⚠ 未检测到集成显卡，禁用独显可能导致黑屏，请谨慎操作。")
+            desc += "\n⚠ 未检测到集成显卡，禁用独显可能导致黑屏，请谨慎操作。"
+        self.mode_desc.configure(text=desc)
         if initial:
             self.log("检测到 %d 个显示适配器：%s" %
-                     (len(gpus), "；".join("%s(%s)" % (g.name, g.vendor) for g in gpus) or "无"))
-            self.read_power(silent=True)
+                     (len(gpus), "；".join("%s（%s）" % (g.name, g.vendor) for g in gpus) or "无"))
+
+    # ---------------------------------------------------------- 应用列表
+
+    def refresh_apps(self):
+        def work():
+            procs = enum_processes()
+            dgpu = {}
+            try:
+                for pid, _name, mem in gpu_processes():
+                    dgpu[str(pid)] = mem
+            except Exception:  # noqa: BLE001
+                pass
+            rules = gpu_pref_all()
+            self.root.after(0, lambda: self._render_apps(procs, dgpu, rules))
+
+        self.log("正在枚举进程 …")
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_apps(self, procs, dgpu, rules):
+        kw = self.search_var.get().strip().lower()
+        merged = {}
+        for pid, path in procs:
+            cur = merged.get(path)
+            if cur is None:
+                merged[path] = {"pids": [pid], "mem": dgpu.get(str(pid))}
+            else:
+                cur["pids"].append(pid)
+                if dgpu.get(str(pid)):
+                    cur["mem"] = dgpu.get(str(pid))
+
+        rows = []
+        for path, info in merged.items():
+            name = os.path.basename(path) or path
+            pref = rules.get(path, 0)
+            mem = ""
+            for p in info["pids"]:
+                if dgpu.get(str(p)):
+                    mem = dgpu[str(p)]
+                    break
+            rows.append((name.lower(), path, name, pref, mem, info["pids"]))
+
+        rows.sort(key=lambda r: (not r[4], not (r[3] in (1, 2)), r[0]))
+        if kw:
+            rows = [r for r in rows if kw in r[0] or kw in str(r[1]).lower()]
+
+        self.proc_rows = rows
+        for it in self.apptree.get_children():
+            self.apptree.delete(it)
+        for _key, path, name, pref, mem, pids in rows:
+            tag = "dgpu" if mem else ("igpu" if pref == 1 else "")
+            self.apptree.insert("", "end", iid=path,
+                                values=(name, PREF_LABELS.get(pref, "默认"),
+                                        mem or "—", path), tags=(tag,))
+        self.refresh_rules()
+        self.log("已加载 %d 个进程，%d 条 GPU 分配规则。" % (len(rows), len(rules)))
+
+    def refresh_rules(self):
+        rules = gpu_pref_all()
+        for it in self.ruletree.get_children():
+            self.ruletree.delete(it)
+        for path, pref in sorted(rules.items(), key=lambda kv: os.path.basename(str(kv[0])).lower()):
+            self.ruletree.insert("", "end", iid=path,
+                                 values=(os.path.basename(path) + "  —  " + path,
+                                         PREF_LABELS.get(pref, "默认")))
+
+    def _selected_app(self):
+        sel = self.apptree.selection()
+        if not sel:
+            return None
+        path = sel[0]
+        for r in self.proc_rows:
+            if r[1] == path:
+                return r
+        return None
+
+    def set_app_pref(self, mode):
+        row = self._selected_app()
+        if not row:
+            messagebox.showinfo("提示", "请先在上方列表里选择一个程序。")
+            return
+        path, name = row[1], row[2]
+        ok, msg = gpu_pref_set(path, mode)
+        if ok:
+            self.log("已把「%s」的 GPU 分配设为：%s" % (name, PREF_LABELS[mode]), "ok")
+            messagebox.showinfo(
+                "已保存",
+                "「%s」\n\nGPU 分配：%s\n\n⚠ 需要完全退出并重新打开该程序后才会生效。"
+                % (name, PREF_LABELS[mode]))
+            self.refresh_apps()
+        else:
+            self.log("设置失败：%s" % msg, "error")
+            messagebox.showerror("失败", "写入注册表失败：\n%s" % msg)
+
+    def add_app(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="选择程序", filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")])
+        if not path:
+            return
+        mode = messagebox.askyesnocancel(
+            "选择 GPU",
+            "为「%s」选择显卡：\n\n是 = 高性能（独显）\n否 = 节能（集显）\n取消 = 放弃"
+            % os.path.basename(path))
+        if mode is None:
+            return
+        ok, msg = gpu_pref_set(path, 2 if mode else 1)
+        self.log("手动添加规则「%s」→ %s：%s"
+                 % (os.path.basename(path), PREF_LABELS[2 if mode else 1], "成功" if ok else msg),
+                 "ok" if ok else "error")
+        self.refresh_rules()
+
+    def remove_rule(self):
+        sel = self.ruletree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先选择一条规则。")
+            return
+        path = sel[0]
+        ok, msg = gpu_pref_remove(path)
+        self.log("删除规则「%s」：%s" % (os.path.basename(path), "成功" if ok else msg),
+                 "ok" if ok else "error")
+        self.refresh_rules()
+
+    def kill_app(self):
+        row = self._selected_app()
+        if not row:
+            messagebox.showinfo("提示", "请先选择一个程序。")
+            return
+        name = row[2]
+        pids = row[5]
+        if not messagebox.askyesno("结束进程",
+                                   "确定结束「%s」（%d 个进程）吗？\n未保存的数据会丢失。"
+                                   % (name, len(pids))):
+            return
+        ok = 0
+        for pid in pids:
+            rc, out, err = run_cmd(["taskkill.exe", "/PID", str(pid), "/F"], timeout=30)
+            if rc == 0:
+                ok += 1
+            self.log("结束 PID %s：%s" % (pid, (out or err or "").strip()[:100]))
+        self.log("已结束 %d/%d 个进程。" % (ok, len(pids)), "ok" if ok else "error")
+        self.refresh_apps()
+
+    # ---------------------------------------------------------- 线程执行器
+
+    def _run(self, fn):
+        if self.busy:
+            messagebox.showinfo("提示", "正在执行其他操作，请稍候。")
+            return
+        self.busy = True
+
+        def work():
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                self.log("内部错误: " + traceback.format_exc(limit=3), "error")
+            finally:
+                self.busy = False
+                self.root.after(0, self.refresh)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ensure_admin(self) -> bool:
+        if is_admin():
+            return True
+        if messagebox.askyesno("需要管理员权限",
+                               "启用/禁用显卡必须拥有管理员权限。\n\n"
+                               "是否立即以管理员身份重新启动本程序？\n"
+                               "（会弹出一次 UAC 确认窗口）"):
+            self.log("正在以管理员身份重新启动 …")
+            if relaunch_as_admin():
+                self.root.destroy()
+                return False
+            messagebox.showerror("失败", "无法提升权限，请手动右键 exe 选择「以管理员身份运行」。")
+        return False
+
+    def on_elevate(self):
+        if relaunch_as_admin():
+            self.root.destroy()
+        else:
+            messagebox.showerror("失败", "无法以管理员身份启动。")
+
+    # ---------------------------------------------------------- 主要动作
+
+    def on_power_saving(self):
+        if not self._ensure_admin():
+            return
+        d = pick_discrete(self.gpus)
+        if not d:
+            messagebox.showinfo("提示", "未检测到 NVIDIA 独显。")
+            return
+        names = "\n".join("• " + g.name for g in d)
+        warn = ""
+        if not pick_integrated(self.gpus):
+            warn = "\n\n⚠ 未检测到集成显卡，禁用独显后可能黑屏！请确认显示器接在集显输出上。"
+        if not messagebox.askyesno(
+                "切换到节能模式",
+                "将禁用以下独立显卡：\n%s\n\n之后所有程序改用集成显卡运行，"
+                "续航更长、发热更低。\n部分正在使用独显的程序可能需要重启后生效。%s\n\n是否继续？"
+                % (names, warn)):
+            self._sync_segment()
+            return
+        self._run(self._do_power_saving)
+
+    def _sync_segment(self):
+        d = pick_discrete(self.gpus)
+        self.seg.select(1 if (d and any(g.enabled for g in d)) else 0)
+
+    def _do_power_saving(self):
+        if not is_admin():
+            self.log("未获取管理员权限，已取消。", "error")
+            return
+        if self.make_restore.get():
+            create_restore_point(emit=self.log)
+        all_ok = True
+        for g in pick_discrete(self.gpus):
+            if not g.enabled:
+                self.log("%s 已经是禁用状态，跳过。" % g.name)
+                continue
+            ok, _ = set_device_state(g, False, emit=self.log)
+            all_ok = all_ok and ok
+        if all_ok:
+            self.log("已切换到节能模式：独显已关闭，系统使用集显。", "ok")
+            p = write_recovery_script()
+            if p:
+                self.log("应急恢复脚本已更新：%s" % p)
+            if self.auto_restart.get():
+                self.log("5 秒后自动重启 …", "warn")
+                do_restart(5)
+        else:
+            self.log("部分设备未能禁用，可先到「应用分配」结束占用独显的程序再试。", "error")
+        self.root.after(0, self._sync_segment)
+
+    def on_performance(self):
+        if not self._ensure_admin():
+            return
+        d = pick_discrete(self.gpus)
+        if not d:
+            messagebox.showinfo("提示", "未检测到 NVIDIA 独显。")
+            return
+        if all(g.enabled for g in d):
+            return
+        self._run(self._do_performance)
+
+    def _do_performance(self):
+        if not is_admin():
+            self.log("未获取管理员权限，已取消。", "error")
+            return
+        if self.make_restore.get():
+            create_restore_point(emit=self.log)
+        all_ok = True
+        for g in pick_discrete(self.gpus):
+            if g.enabled:
+                continue
+            ok, _ = set_device_state(g, True, emit=self.log)
+            all_ok = all_ok and ok
+        if all_ok:
+            self.log("已切换到高性能模式：独显已启用。", "ok")
+            if self.auto_restart.get():
+                self.log("5 秒后自动重启 …", "warn")
+                do_restart(5)
+        else:
+            self.log("启用失败，请检查设备管理器。", "error")
+        self.root.after(0, self._sync_segment)
 
     def _selected(self):
         sel = self.tree.selection()
@@ -1076,142 +2095,6 @@ class App:
                                           self.root.clipboard_append(dev.instance_id)))
         menu.tk_popup(event.x_root, event.y_root)
 
-    # ---------------- 线程执行器
-
-    def _run(self, fn):
-        if self.busy:
-            messagebox.showinfo("提示", "正在执行其他操作，请稍候。")
-            return
-        self.busy = True
-        self._set_buttons(False)
-
-        def work():
-            try:
-                fn()
-            except Exception:  # noqa: BLE001
-                self.log("内部错误: " + traceback.format_exc(limit=3), "error")
-            finally:
-                self.busy = False
-                self.root.after(0, lambda: self._set_buttons(True))
-                self.root.after(0, self.refresh)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _set_buttons(self, on: bool):
-        state = "normal" if on else "disabled"
-        for b in (self.btn_power, self.btn_perf, self.btn_restart, self.btn_logoff):
-            b.config(state=state)
-
-    # ---------------- 主要动作
-
-    def on_elevate(self):
-        self.log("正在请求管理员权限 ...")
-        if not relaunch_as_admin():
-            messagebox.showerror("失败", "无法以提升的权限启动程序。")
-        else:
-            self.root.destroy()
-
-    def _ensure_admin(self) -> bool:
-        """在主线程中检查权限，不足时询问是否自动提权重启"""
-        if is_admin():
-            return True
-        if messagebox.askyesno(
-                "需要管理员权限",
-                "启用/禁用显卡必须拥有管理员权限。\n\n"
-                "是否立即以管理员身份重新启动本程序？\n"
-                "（会弹出一次 UAC 确认窗口）"):
-            self.log("正在以管理员身份重新启动 ...")
-            if relaunch_as_admin():
-                self.root.destroy()
-                return False
-            messagebox.showerror("失败", "无法提升权限，请手动右键 exe 选择「以管理员身份运行」。")
-        return False
-
-    def on_power_saving(self):
-        if not self._ensure_admin():
-            return
-        d = pick_discrete(self.gpus)
-        if not d:
-            messagebox.showinfo("提示", "未检测到 NVIDIA 独显。")
-            return
-        names = "\n".join("• " + g.name for g in d)
-        warn = ""
-        if not pick_integrated(self.gpus):
-            warn = "\n\n⚠ 未检测到集成显卡，禁用独显后可能黑屏！请确认你的显示器接在集显输出上。"
-        if not messagebox.askyesno(
-                "切换到节能模式",
-                "将禁用以下独立显卡：\n%s\n\n之后所有程序改用集成显卡运行，"
-                "续航更长、发热更低。\n部分正在使用独显的程序可能需要重启后生效。%s\n\n是否继续？"
-                % (names, warn)):
-            return
-        self._run(self._do_power_saving)
-
-    def _do_power_saving(self):
-        if not is_admin():
-            self.log("未获取管理员权限，已取消。", "error")
-            return
-
-        if self.make_restore.get():
-            create_restore_point(emit=self.log)
-
-        d = pick_discrete(self.gpus)
-        all_ok = True
-        for g in d:
-            if not g.enabled:
-                self.log("%s 已经是禁用状态，跳过。" % g.name)
-                continue
-            ok, _ = set_device_state(g, False, emit=self.log)
-            all_ok = all_ok and ok
-
-        if all_ok:
-            self.log("已切换到节能模式：独显已关闭，系统使用集显。", "ok")
-            p = write_recovery_script()
-            if p:
-                self.log("应急恢复脚本已更新：%s" % p)
-            if self.auto_restart.get():
-                self.log("5 秒后自动重启 ...", "warn")
-                do_restart(5)
-            else:
-                messagebox.showinfo("完成",
-                                    "已切换为节能模式。\n\n若屏幕无变化或应用异常，"
-                                    "建议注销或重启一次以完全释放独显。")
-        else:
-            self.log("部分设备未能禁用，可能是被占用或系统不允许。可先结束占用进程再试。", "error")
-
-    def on_performance(self):
-        if not self._ensure_admin():
-            return
-        d = pick_discrete(self.gpus)
-        if not d:
-            messagebox.showinfo("提示", "未检测到 NVIDIA 独显。")
-            return
-        if all(g.enabled for g in d):
-            messagebox.showinfo("提示", "独显已处于启用状态。")
-            return
-        self._run(self._do_performance)
-
-    def _do_performance(self):
-        if not is_admin():
-            self.log("未获取管理员权限，已取消。", "error")
-            return
-        if self.make_restore.get():
-            create_restore_point(emit=self.log)
-        all_ok = True
-        for g in pick_discrete(self.gpus):
-            if g.enabled:
-                continue
-            ok, _ = set_device_state(g, True, emit=self.log)
-            all_ok = all_ok and ok
-        if all_ok:
-            self.log("已切换到高性能模式：独显已启用。", "ok")
-            if self.auto_restart.get():
-                self.log("5 秒后自动重启 ...", "warn")
-                do_restart(5)
-            else:
-                messagebox.showinfo("完成", "独显已启用。\n部分程序可能需要重启后才能识别到独显。")
-        else:
-            self.log("启用失败，请检查设备管理器。", "error")
-
     def _enable_selected(self):
         g = self._selected()
         if not g:
@@ -1234,33 +2117,33 @@ class App:
 
     def on_restart(self):
         if messagebox.askyesno("重启", "确定立即重启电脑吗？\n（重启可彻底释放被占用的独显）"):
-            self.log("正在重启 ...", "warn")
+            self.log("正在重启 …", "warn")
             do_restart(3)
 
     def on_shutdown(self):
         if messagebox.askyesno("关机", "确定立即关机吗？"):
-            self.log("正在关机 ...", "warn")
+            self.log("正在关机 …", "warn")
             do_shutdown(3)
 
     def on_logoff(self):
         if messagebox.askyesno("注销", "确定注销当前用户吗？\n所有程序会被关闭，独显占用将被释放。"):
-            self.log("正在注销 ...", "warn")
+            self.log("正在注销 …", "warn")
             do_logoff()
 
     def _sleep(self):
-        self.log("进入睡眠 ...", "warn")
+        self.log("进入睡眠 …", "warn")
         do_sleep()
 
     def _open_nv(self):
-        ok, p = open_nvidia_panel()
-        self.log("打开 NVIDIA 控制面板: %s" % ("成功" if ok else "失败（可能未安装驱动）"),
+        ok, _p = open_nvidia_panel()
+        self.log("打开 NVIDIA 控制面板：%s" % ("成功" if ok else "失败（可能未安装驱动）"),
                  "ok" if ok else "warn")
 
     def _restore_point(self):
         ok, msg = create_restore_point(emit=self.log)
         messagebox.showinfo("系统还原点", msg if ok else "失败：" + msg)
 
-    # ---------------- 监控
+    # ---------------------------------------------------------- 监控
 
     def _monitor_loop(self):
         while not self.stop_monitor.is_set():
@@ -1271,53 +2154,22 @@ class App:
     def _render_stats(self, s):
         if not s:
             for k in self.stat_vars:
-                self.stat_vars[k].set("-")
-            self.smi_note.config(text="独显当前不可用（已禁用）或 nvidia-smi 未响应。")
+                self.stat_vars[k].set("—")
+            self.smi_note.configure(text="独显当前不可用（已禁用）或 nvidia-smi 未响应。")
             return
-        self.smi_note.config(text="")
+        self.smi_note.configure(text="")
         self.stat_vars["name"].set(s["name"])
         self.stat_vars["temp"].set("%s °C" % (s["temp"] if s["temp"] is not None else "N/A"))
         self.stat_vars["util"].set("%s %%" % (s["util"] if s["util"] is not None else "N/A"))
         if s["mem_used"] is not None and s["mem_total"]:
-            self.stat_vars["mem"].set("%.0f / %.0f MiB (%.0f%%)" %
-                                      (s["mem_used"], s["mem_total"],
-                                       100.0 * s["mem_used"] / max(s["mem_total"], 1)))
+            self.stat_vars["mem"].set("%.0f / %.0f MiB" % (s["mem_used"], s["mem_total"]))
         else:
             self.stat_vars["mem"].set("N/A")
         self.stat_vars["power"].set("%s W" % (s["power"] if s["power"] is not None else "N/A"))
         self.stat_vars["plimit"].set(
             "%s W" % s["power_limit"] if s["power_limit"] is not None else "不支持/未设置")
 
-    # ---------------- 进程
-
-    def refresh_processes(self):
-        for i in self.ptree.get_children():
-            self.ptree.delete(i)
-        procs = gpu_processes()
-        if not procs:
-            self.ptree.insert("", "end", values=("-", "未检测到占用独显的进程", "-"))
-            return
-        for pid, name, mem in procs:
-            self.ptree.insert("", "end", values=(pid, name, mem))
-
-    def kill_process(self):
-        sel = self.ptree.selection()
-        if not sel:
-            messagebox.showinfo("提示", "请先选择一个进程。")
-            return
-        vals = self.ptree.item(sel[0], "values")
-        pid = vals[0]
-        if not str(pid).isdigit():
-            return
-        if not messagebox.askyesno("结束进程", "确定结束 PID %s（%s）吗？\n未保存的数据会丢失。"
-                                   % (pid, vals[1])):
-            return
-        rc, out, err = run_cmd(["taskkill.exe", "/PID", pid, "/F"], timeout=30)
-        self.log("结束进程 %s: %s" % (pid, (out or err or "").strip()[:120]),
-                 "ok" if rc == 0 else "error")
-        self.refresh_processes()
-
-    # ---------------- 功耗
+    # ---------------------------------------------------------- 功耗
 
     def read_power(self, silent=False):
         lim = power_limits()
@@ -1330,27 +2182,24 @@ class App:
             self.power_limit_var.set("%.0f" % cur)
         if not silent:
             messagebox.showinfo("功耗信息",
-                                "当前功耗上限: %s W\n可调范围: %s ~ %s W" %
-                                (cur or "-", mn or "-", mx or "-"))
+                                "当前功耗上限：%s W\n可调范围：%s ~ %s W" % (cur or "-", mn or "-", mx or "-"))
         else:
-            self.log("功耗上限: %s W（可调 %s ~ %s W）" % (cur or "-", mn or "-", mx or "-"))
+            self.log("功耗上限：%s W（可调 %s ~ %s W）" % (cur or "-", mn or "-", mx or "-"))
 
     def apply_power(self):
-        val = self.power_limit_var.get().strip()
         try:
-            watts = float(val)
+            watts = float(self.power_limit_var.get().strip())
         except Exception:  # noqa: BLE001
             messagebox.showwarning("输入错误", "请输入有效的功率数值。")
             return
         if not is_admin():
             messagebox.showwarning("权限不足", "设置功耗上限需要管理员权限。")
             return
-        if not messagebox.askyesno("确认", "将功耗上限设置为 %.0f W？\n"
-                                           "过低的功耗会明显降低性能。" % watts):
+        if not messagebox.askyesno("确认", "将功耗上限设置为 %.0f W？\n过低的功耗会明显降低性能。" % watts):
             return
         self._run(lambda: set_power_limit(watts, emit=self.log))
 
-    # ---------------- 其他工具
+    # ---------------------------------------------------------- 其他工具
 
     def toggle_autostart(self):
         want = self.auto_power_var.get()
@@ -1381,18 +2230,18 @@ class App:
     def make_report(self):
         path = os.path.join(app_dir(), "诊断报告_%s.txt" % datetime.now().strftime("%Y%m%d_%H%M%S"))
         lines = ["%s 诊断报告  %s" % (APP_NAME, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                 "=" * 60, ""]
-        lines.append("[显示适配器]")
+                 "=" * 60, "", "[显示适配器]"]
         for g in self.gpus:
             lines.append("  %s | %s | %s | %s | 驱动 %s | 显存 %s | %s"
                          % (g.name, g.vendor, g.kind, g.status_text,
                             g.driver or "-", g.vram_text, g.instance_id))
-        lines.append("")
-        lines.append("[nvidia-smi]")
+        lines += ["", "[GPU 分配规则]"]
+        for k, v in gpu_pref_all().items():
+            lines.append("  %s = %s" % (k, PREF_LABELS.get(v, v)))
+        lines += ["", "[nvidia-smi]"]
         ok, out = smi(["-q"], timeout=60)
         lines.append(out if ok else "不可用：" + (out or ""))
-        lines.append("")
-        lines.append("[系统]")
+        lines += ["", "[系统]"]
         rc, out, err = run_cmd(["systeminfo"], timeout=120)
         lines.append(out[:4000] if rc == 0 else (err or "读取失败"))
         try:
@@ -1401,16 +2250,17 @@ class App:
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("失败", str(e))
             return
-        self.log("诊断报告已生成: %s" % path, "ok")
+        self.log("诊断报告已生成：%s" % path, "ok")
         open_uri(path)
 
     def make_recovery(self):
         p = write_recovery_script()
         if p:
-            self.log("恢复脚本已生成: %s" % p, "ok")
+            self.log("恢复脚本已生成：%s" % p, "ok")
             messagebox.showinfo("完成", "已生成：\n%s\n\n若切换后黑屏，双击运行即可重新启用所有显卡。" % p)
         else:
             messagebox.showerror("失败", "无法写入脚本，请检查目录权限。")
+
 
 
 # ============================================================ 命令行模式
