@@ -32,7 +32,7 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
 APP_NAME = "GPU 切换助手"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_ID = "GpuSwitcher"
 TASK_NAME = "GpuSwitcher-AutoPowerSaving"
 

@@ -18,6 +18,20 @@
 
 ---
 
+## 下载
+
+👉 **[Releases 页面下载](https://github.com/xavier111222/GpuSwitcher/releases/latest)**
+→ 资产 `GpuSwitcher-v1.1.0.exe`（单文件绿色版，约 11 MB，下载后双击即用）
+
+同一页面附 `SHA256SUMS.txt`，校验：
+
+```bat
+certutil -hashfile GpuSwitcher-v1.1.0.exe SHA256
+```
+
+> GitHub Release 的资产名不支持中文，所以发布文件名用了英文；
+> 复制到桌面后会自动叫 `GPU切换助手.exe`（源码内置名即为此）。
+
 ## 快速开始
 
 1. 双击 **`GPU切换助手.exe`**
