@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes  # noqa: F401  必须显式导入，打包后 ctypes.wintypes 属性才可用
+import collections
 import json
 import math
+import queue
 import os
 import re
 import shutil
@@ -1421,6 +1423,21 @@ def gpu_usage_by_pid(interval=0.4):
 PREF_LABELS = {0: "让 Windows 决定", 1: "节能（集显）", 2: "高性能（独显）"}
 PREF_SHORT = {0: "默认", 1: "集显", 2: "独显"}
 
+# 一行运行中的程序（批量操作的基本单位）
+AppRow = collections.namedtuple(
+    "AppRow", "path name pref usage on_dgpu pids mem util")
+
+# 系统关键进程：不允许"重启"，避免把桌面/资源管理器搞崩
+PROTECTED_PROCS = {
+    "explorer.exe", "dwm.exe", "winlogon.exe", "csrss.exe", "smss.exe",
+    "lsass.exe", "services.exe", "svchost.exe", "wininit.exe", "spoolsv.exe",
+    "fontdrvhost.exe", "audiodg.exe", "ctfmon.exe", "sihost.exe",
+    "taskhostw.exe", "runtimebroker.exe", "dllhost.exe", "wmiprvse.exe",
+    "shellexperiencehost.exe", "startmenuexperiencehost.exe",
+    "searchapp.exe", "backgroundtaskhost.exe", "applicationframehost.exe",
+    "lsaiso.exe", "securityhealthservice.exe", "msmpeng.exe", "nissrv.exe",
+}
+
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 
@@ -1576,7 +1593,13 @@ class App:
         self.auto_power_var = tk.BooleanVar(value=False)
         self.power_limit_var = tk.StringVar(value="")
         self.search_var = tk.StringVar()
+        self.only_dgpu_var = tk.BooleanVar(value=False)
         self.proc_rows = []
+        self._apps_cache = None
+        # 线程安全 UI 队列：工作线程一律通过 ui() 投递回调，
+        # 避免直接调 root.after 偶发 "main thread is not in main loop"
+        self.ui_q = queue.Queue()
+        self.root.after(60, self._drain_ui)
         self.stat_vars = {}
 
         root.title("%s v%s" % (APP_NAME, APP_VERSION))
@@ -1600,6 +1623,25 @@ class App:
         self.refresh(initial=True)
         self.refresh_apps()
         threading.Thread(target=self._monitor_loop, daemon=True).start()
+
+    # ---------------------------------------------------------- 线程安全 UI
+
+    def ui(self, fn, *args):
+        """把回调投递到主线程执行（可从任意线程调用）"""
+        self.ui_q.put((fn, args))
+
+    def _drain_ui(self):
+        try:
+            while True:
+                fn, args = self.ui_q.get_nowait()
+                try:
+                    fn(*args)
+                except Exception:  # noqa: BLE001
+                    self._log_direct("界面更新出错: " + traceback.format_exc(limit=3),
+                                     "error")
+        except queue.Empty:
+            pass
+        self.root.after(60, self._drain_ui)
 
     # ---------------------------------------------------------- 样式
 
@@ -1841,54 +1883,102 @@ class App:
                  fg=THEME["text"], font=F(13, "bold")).pack(anchor="w")
         tk.Label(tip,
                  text="Windows 原生支持按程序分配 GPU。下面列出正在运行的程序，"
-                      "选中后点按钮即可指定：\n"
-                      "「集显」= 省电模式，程序改用集成显卡；「独显」= 高性能，"
-                      "程序使用 NVIDIA 显卡。设置后需重启该程序生效。",
+                      "红色「独显」标记 = 此刻正跑在 NVIDIA 显卡上。\n"
+                      "支持多选：Ctrl / Shift 点击，或点「全选」。"
+                      "选中后点按钮即可批量指定：\n"
+                      "「集显」= 省电，程序改用集成显卡；「独显」= 高性能，"
+                      "程序使用 NVIDIA 显卡。设置后需重启该程序生效"
+                      "（可用「重启程序」按钮一键完成）。",
                  bg=THEME["card"], fg=THEME["text2"], font=F(10),
                  justify="left", wraplength=px(640)).pack(anchor="w", pady=(px(6), px(0)))
 
         box = self._card(p, "运行中的程序")
+
+        # 汇总条：独显占用统计 + 当前选中数
+        stat = tk.Frame(box, bg=THEME["card"])
+        stat.pack(fill="x", pady=(px(0), px(10)))
+        self.app_stat = tk.Label(stat, text="正在扫描 …", bg=THEME["card"],
+                                 fg=THEME["text2"], font=F(10))
+        self.app_stat.pack(side="left")
+        self.sel_label = tk.Label(stat, text="未选择", bg=THEME["card"],
+                                  fg=THEME["blue"], font=F(10, "bold"))
+        self.sel_label.pack(side="right")
+
         filt = tk.Frame(box, bg=THEME["card"])
         filt.pack(fill="x", pady=(px(0), px(10)))
         e = tk.Entry(filt, textvariable=self.search_var, relief="solid", bd=1,
                      highlightthickness=1, highlightcolor=THEME["blue"],
-                     highlightbackground=THEME["border"], font=F(10), width=30)
+                     highlightbackground=THEME["border"], font=F(10), width=22)
         e.pack(side="left", ipady=px(4))
-        e.bind("<Return>", lambda _e: self.refresh_apps())
-        AppleButton(filt, "搜索", command=self.refresh_apps, style="secondary",
-                    width=px(72), height=px(30), radius=px(9), font=F(10)).pack(side="left", padx=px(8))
+        e.bind("<Return>", lambda _e: self._rerender_apps())
+        AppleButton(filt, "搜索", command=self._rerender_apps, style="secondary",
+                    width=px(64), height=px(30), radius=px(9), font=F(10)).pack(side="left", padx=px(8))
         AppleButton(filt, "刷新", command=self.refresh_apps, style="secondary",
-                    width=px(72), height=px(30), radius=px(9), font=F(10)).pack(side="left")
+                    width=px(64), height=px(30), radius=px(9), font=F(10)).pack(side="left")
+        tk.Label(filt, text="只看独显上的", bg=THEME["card"], fg=THEME["text"],
+                 font=F(10)).pack(side="left", padx=(px(16), px(6)))
+        ToggleSwitch(filt, variable=self.only_dgpu_var, command=self._rerender_apps,
+                     bg=THEME["card"]).pack(side="left")
 
-        cols = ("name", "pref", "dgpu", "path")
-        self.apptree = ttk.Treeview(box, columns=cols, show="headings", height=11,
-                                    style="Apple.Treeview")
-        for c, t, w in (("name", "程序", 150), ("pref", "GPU 分配", 110),
-                        ("dgpu", "独显占用", 110), ("path", "路径", 300)):
+        cols = ("name", "gpu", "usage", "pref", "path")
+        self.apptree = ttk.Treeview(box, columns=cols, show="headings", height=12,
+                                    style="Apple.Treeview", selectmode="extended")
+        for c, t, w in (("name", "程序", 150), ("gpu", "当前显卡", 96),
+                        ("usage", "独显占用", 110), ("pref", "GPU 分配", 118),
+                        ("path", "路径", 236)):
             self.apptree.heading(c, text=t)
-            self.apptree.column(c, width=w, anchor="w")
+            self.apptree.column(c, width=px(w), anchor="w")
         self.apptree.pack(fill="x")
         self.apptree.tag_configure("dgpu", foreground=THEME["red"])
         self.apptree.tag_configure("igpu", foreground=THEME["green"])
+        self.apptree.bind("<<TreeviewSelect>>", lambda _e: self._update_sel())
+        self.apptree.bind("<Control-a>", lambda _e: self._select_all())
+        self.apptree.bind("<Control-A>", lambda _e: self._select_all())
 
+        # 选择辅助
+        row0 = tk.Frame(box, bg=THEME["card"])
+        row0.pack(fill="x", pady=(px(10), px(0)))
+        AppleButton(row0, "全选", command=self._select_all, style="secondary",
+                    width=px(66), height=px(30), radius=px(9), font=F(10)).pack(side="left")
+        AppleButton(row0, "反选", command=self._invert_sel, style="secondary",
+                    width=px(66), height=px(30), radius=px(9), font=F(10)).pack(side="left", padx=px(8))
+        AppleButton(row0, "清空选择", command=lambda: self.apptree.selection_remove(
+            self.apptree.selection()), style="plain",
+            width=px(78), height=px(30), radius=px(9), font=F(10)).pack(side="left")
+        AppleButton(row0, "选中全部占用独显的", command=self._select_dgpu, style="primary",
+                    width=px(168), height=px(30), radius=px(9), font=F(10)).pack(side="left", padx=px(8))
+
+        # 批量分配
         row = tk.Frame(box, bg=THEME["card"])
         row.pack(fill="x", pady=(px(12), px(0)))
-        AppleButton(row, "🍃 改用集显（省电）", command=lambda: self.set_app_pref(1),
-                    style="success", width=px(170), height=px(36), font=F(10)).pack(side="left")
-        AppleButton(row, "⚡ 改用独显（高性能）", command=lambda: self.set_app_pref(2),
-                    style="primary", width=px(180), height=px(36), font=F(10)).pack(side="left", padx=px(10))
+        AppleButton(row, "🍃 批量改用集显（省电）", command=lambda: self.set_app_pref(1),
+                    style="success", width=px(178), height=px(36), font=F(10)).pack(side="left")
+        AppleButton(row, "⚡ 批量改用独显", command=lambda: self.set_app_pref(2),
+                    style="primary", width=px(150), height=px(36), font=F(10)).pack(side="left", padx=px(10))
         AppleButton(row, "恢复默认", command=lambda: self.set_app_pref(0),
-                    style="secondary", width=px(100), height=px(36), font=F(10)).pack(side="left")
+                    style="secondary", width=px(96), height=px(36), font=F(10)).pack(side="left")
 
+        # 批量进程操作
         row2 = tk.Frame(box, bg=THEME["card"])
         row2.pack(fill="x", pady=(px(10), px(0)))
-        AppleButton(row2, "结束选中进程", command=self.kill_app, style="danger",
-                    width=px(130), height=px(34), font=F(10)).pack(side="left")
-        AppleButton(row2, "手动添加程序…", command=self.add_app, style="secondary",
-                    width=px(150), height=px(34), font=F(10)).pack(side="left", padx=px(10))
-        AppleButton(row2, "打开 Windows 设置",
+        AppleButton(row2, "🔄 重启程序（生效）", command=self.restart_apps,
+                    style="primary", width=px(178), height=px(34), font=F(10)).pack(side="left")
+        AppleButton(row2, "⚡ 一键释放独显", command=self.quick_release,
+                    style="danger", width=px(150), height=px(34), font=F(10)).pack(side="left", padx=px(10))
+        AppleButton(row2, "结束进程", command=self.kill_app, style="danger",
+                    width=px(96), height=px(34), font=F(10)).pack(side="left")
+
+        row3 = tk.Frame(box, bg=THEME["card"])
+        row3.pack(fill="x", pady=(px(10), px(0)))
+        AppleButton(row3, "手动添加程序…", command=self.add_app, style="secondary",
+                    width=px(150), height=px(34), font=F(10)).pack(side="left")
+        AppleButton(row3, "打开 Windows 设置",
                     command=lambda: open_uri("ms-settings:display-advancedgraphics"),
-                    style="secondary", width=px(170), height=px(34), font=F(10)).pack(side="left")
+                    style="secondary", width=px(170), height=px(34), font=F(10)).pack(side="left", padx=px(10))
+        tk.Label(box, text="提示：改完分配后必须完全退出并重新打开程序才生效；"
+                           "系统关键进程（explorer / dwm 等）不会被重启。",
+                 bg=THEME["card"], fg=THEME["text3"], font=F(9),
+                 wraplength=px(660), justify="left").pack(anchor="w", pady=(px(10), px(0)))
 
         box3 = self._card(p, "已保存的规则")
         self.ruletree = ttk.Treeview(box3, columns=("path", "rule"), show="headings",
@@ -1977,19 +2067,21 @@ class App:
     # ---------------------------------------------------------- 日志
 
     def log(self, msg: str, level: str = "info"):
+        try:
+            with open(log_path(), "a", encoding="utf-8") as f:
+                f.write("[%s] %s\n" % (datetime.now().isoformat(timespec="seconds"), msg))
+        except Exception:  # noqa: BLE001
+            pass
         ts = datetime.now().strftime("%H:%M:%S")
-        text = "[%s] %s\n" % (ts, msg)
+        self.ui(self._log_direct, "[%s] %s\n" % (ts, msg), level)
 
-        def _write():
+    def _log_direct(self, text: str, level: str = "info"):
+        """仅主线程调用：直接写入日志框"""
+        try:
             self.logbox.configure(state="normal")
             self.logbox.insert("end", text, level)
             self.logbox.see("end")
             self.logbox.configure(state="disabled")
-
-        self.root.after(0, _write)
-        try:
-            with open(log_path(), "a", encoding="utf-8") as f:
-                f.write("[%s] %s\n" % (datetime.now().isoformat(timespec="seconds"), msg))
         except Exception:  # noqa: BLE001
             pass
 
@@ -2003,7 +2095,7 @@ class App:
     def refresh(self, initial=False):
         def work():
             gpus = scan_gpus()
-            self.root.after(0, lambda: self._render_gpus(gpus, initial))
+            self.ui(self._render_gpus, gpus, initial)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -2041,7 +2133,7 @@ class App:
 
     # ---------------------------------------------------------- 应用列表
 
-    def refresh_apps(self):
+    def refresh_apps(self, silent=False):
         def work():
             try:
                 procs, how = enum_processes_any()
@@ -2050,18 +2142,33 @@ class App:
                     usage = gpu_usage_by_pid()
                 except Exception:  # noqa: BLE001
                     pass
+                # 兜底：nvidia-smi 也能给出独显上的进程（WDDM 下常只有 PID）
+                try:
+                    for pid, _n, _m in gpu_processes():
+                        if pid.isdigit() and int(pid) not in usage:
+                            usage[int(pid)] = {"dgpu": 0.0, "dgpu_mem": 1}
+                except Exception:  # noqa: BLE001
+                    pass
                 rules = gpu_pref_all()
-                self.root.after(0, lambda: self._render_apps(procs, usage, rules, how))
+                self.ui(self._render_apps, procs, usage, rules, how)
             except Exception:  # noqa: BLE001
                 err = traceback.format_exc(limit=3)
                 self.log("枚举进程失败：" + err, "error")
-                self.root.after(0, lambda: self._render_apps([], {}, {}, "error"))
+                self.ui(self._render_apps, [], {}, {}, "error")
 
-        self.log("正在枚举进程 …")
+        if not silent:
+            self.log("正在枚举进程 …")
         threading.Thread(target=work, daemon=True).start()
 
+    def _rerender_apps(self):
+        """只按筛选条件重画表格（用已缓存的数据，秒开）"""
+        if self._apps_cache:
+            self._render_apps(*self._apps_cache)
+
     def _render_apps(self, procs, usage, rules, how="native"):
+        self._apps_cache = (procs, usage, rules, how)
         kw = self.search_var.get().strip().lower()
+        only_dgpu = bool(self.only_dgpu_var.get())
         merged = {}
         for pid, path in procs:
             cur = merged.get(path)
@@ -2074,46 +2181,60 @@ class App:
         for path, info in merged.items():
             name = os.path.basename(path) or path
             pref = rules.get(path, 0)
-            # 汇总该程序所有进程在独显上的占用（任务管理器同源）
+            # 汇总该程序所有进程在独显上的占用（与任务管理器同源）
             util = 0.0
             mem = 0
-            on_dgpu = False
             for p in info["pids"]:
                 e = usage.get(p) or {}
                 if e.get("dgpu_mem"):
-                    mem = max(mem, int(e["dgpu_mem"]))
+                    mem += int(e["dgpu_mem"])
                 if e.get("dgpu"):
                     util = max(util, float(e["dgpu"]))
             on_dgpu = bool(mem or util > 0.5)
-            if mem >= 1048576:
-                dgpu_txt = "%.0f MB" % (mem / 1048576)
-            elif mem:
-                dgpu_txt = "%d KB" % (mem // 1024)
-            elif util > 0.5:
-                dgpu_txt = "%.0f%%" % util
+            if on_dgpu:
+                if mem >= 1048576:
+                    dgpu_txt = "%.0f MB" % (mem / 1048576)
+                elif mem:
+                    dgpu_txt = "%d KB" % (mem // 1024)
+                else:
+                    dgpu_txt = "—"
+                if util > 0.5:
+                    dgpu_txt += " · %.0f%%" % util
             else:
                 dgpu_txt = "—"
-            rows.append((name.lower(), path, name, pref, dgpu_txt, on_dgpu, info["pids"]))
+            rows.append(AppRow(path, name, pref, dgpu_txt, on_dgpu,
+                               info["pids"], mem, util))
 
-        rows.sort(key=lambda r: (not r[5], not (r[3] in (1, 2)), r[0]))
+        rows.sort(key=lambda r: (not r.on_dgpu, r.mem == 0, -r.mem, r.name.lower()))
         if kw:
-            rows = [r for r in rows if kw in r[0] or kw in str(r[1]).lower()]
+            rows = [r for r in rows if kw in r.name.lower() or kw in str(r.path).lower()]
+        if only_dgpu:
+            rows = [r for r in rows if r.on_dgpu]
 
         self.proc_rows = rows
         for it in self.apptree.get_children():
             self.apptree.delete(it)
         if not rows:
             self.apptree.insert("", "end",
-                                values=("—", "未能枚举到进程，请点击「刷新」重试", "—", "—"))
+                                values=("—", "—", "没有符合条件的程序", "—", "—"))
         n_dgpu = 0
-        for _key, path, name, pref, dgpu_txt, on_dgpu, pids in rows:
-            if on_dgpu:
+        total_mem = 0
+        for r in rows:
+            if r.on_dgpu:
                 n_dgpu += 1
-            tag = "dgpu" if on_dgpu else ("igpu" if pref == 1 else "")
-            self.apptree.insert("", "end", iid=path,
-                                values=(name, PREF_LABELS.get(pref, "默认"),
-                                        dgpu_txt, path), tags=(tag,))
+                total_mem += r.mem
+            tag = "dgpu" if r.on_dgpu else ("igpu" if r.pref == 1 else "")
+            self.apptree.insert("", "end", iid=r.path,
+                                values=(r.name, "🔴 独显" if r.on_dgpu else "—",
+                                        r.usage, PREF_SHORT.get(r.pref, "默认"),
+                                        r.path), tags=(tag,))
+        self._update_sel()
         self.refresh_rules()
+        self.app_stat.configure(
+            text="共 %d 个程序 · 🔴 %d 个正在使用独显 · 显存合计 %s"
+                 % (len(rows), n_dgpu,
+                    ("%.0f MB" % (total_mem / 1048576)) if total_mem >= 1048576
+                    else ("%d KB" % (total_mem // 1024) if total_mem else "0")))
         self.log("已加载 %d 个程序（%s），其中 %d 个正在使用独显；%d 条分配规则。"
                  % (len(rows), "原生 API" if how == "native" else "备用方案",
                     n_dgpu, len(rules)))
@@ -2127,38 +2248,87 @@ class App:
                                  values=(os.path.basename(path) + "  —  " + path,
                                          PREF_LABELS.get(pref, "默认")))
 
+    # ------------------------------------------------------ 选择（支持多选）
+
+    def _rows_of(self, paths):
+        by = {r.path: r for r in self.proc_rows}
+        return [by[p] for p in paths if p in by]
+
+    def _selected_apps(self):
+        return self._rows_of(self.apptree.selection())
+
     def _selected_app(self):
+        rows = self._selected_apps()
+        return rows[0] if rows else None
+
+    def _update_sel(self):
         sel = self.apptree.selection()
         if not sel:
-            return None
-        path = sel[0]
-        for r in self.proc_rows:
-            if r[1] == path:
-                return r
-        return None
+            self.sel_label.configure(text="未选择", fg=THEME["text3"])
+            return
+        n_dgpu = sum(1 for r in self._rows_of(sel) if r.on_dgpu)
+        txt = "已选中 %d 项" % len(sel)
+        if n_dgpu:
+            txt += "（%d 个在独显上）" % n_dgpu
+        self.sel_label.configure(text=txt, fg=THEME["blue"])
+
+    def _select_all(self):
+        self.apptree.selection_set(self.apptree.get_children())
+        self._update_sel()
+        return "break"
+
+    def _invert_sel(self):
+        cur = set(self.apptree.selection())
+        self.apptree.selection_set([i for i in self.apptree.get_children() if i not in cur])
+        self._update_sel()
+
+    def _select_dgpu(self):
+        rows = [r for r in self.proc_rows if r.on_dgpu]
+        if not rows:
+            messagebox.showinfo("提示", "当前没有检测到正在使用独显的程序。")
+            return
+        self.only_dgpu_var.set(True)
+        self._rerender_apps()
+        self.apptree.selection_set([r.path for r in rows])
+        self._update_sel()
+        self.log("已选中 %d 个正在使用独显的程序。" % len(rows), "ok")
+
+    # ------------------------------------------------------ 批量分配
 
     def set_app_pref(self, mode):
-        row = self._selected_app()
-        if not row:
-            messagebox.showinfo("提示", "请先在上方列表里选择一个程序。")
+        rows = self._selected_apps()
+        if not rows:
+            messagebox.showinfo("提示", "请先在上方列表里选择程序（Ctrl / Shift 可多选）。")
             return
-        path, name = row[1], row[2]
-        on_dgpu = len(row) > 5 and row[5]
-        ok, msg = gpu_pref_set(path, mode)
-        if ok:
-            self.log("已把「%s」的 GPU 分配设为：%s" % (name, PREF_LABELS[mode]), "ok")
-            note = ""
-            if on_dgpu:
-                note = ("\n\n检测到该程序当前正在独显上运行，"
-                        "请完全退出并重新打开它，新的分配才会生效。")
-            messagebox.showinfo(
-                "已保存",
-                "「%s」\n\nGPU 分配：%s\n\n⚠ 需要完全退出并重新打开该程序后才会生效。%s"
-                % (name, PREF_LABELS[mode], note))
-            self.refresh_apps()
+        ok_n, failed, running = 0, [], []
+        for r in rows:
+            ok, msg = gpu_pref_set(r.path, mode)
+            if ok:
+                ok_n += 1
+                if r.on_dgpu:
+                    running.append(r)
+            else:
+                failed.append("%s：%s" % (r.name, msg))
+        for f in failed:
+            self.log("设置失败 " + f, "error")
+        self.log("批量设置「%s」：成功 %d / %d" % (PREF_LABELS[mode], ok_n, len(rows)),
+                 "ok" if ok_n else "error")
+        detail = ("\n\n失败 %d 个：\n%s" % (len(failed), "\n".join(failed[:6]))) if failed else ""
+        if not ok_n:
+            messagebox.showerror("失败", "没有写入成功。%s" % detail)
+            return
+        base = "已把 %d 个程序的 GPU 分配设为：%s\n\n⚠ 需要完全退出并重新打开程序后才会生效。%s" \
+               % (ok_n, PREF_LABELS[mode], detail)
+        if running and mode != 2:
+            if messagebox.askyesno(
+                    "已保存 · 是否立即重启？",
+                    base + "\n\n检测到其中 %d 个正在独显上运行，"
+                           "是否立即结束并重新打开它们？\n（未保存的数据会丢失）" % len(running)):
+                self._run(lambda: self._do_restart_rows(running))
+                return
         else:
-            self.log("设置失败：%s" % msg, "error")
-            messagebox.showerror("失败", "写入注册表失败：\n%s" % msg)
+            messagebox.showinfo("已保存", base)
+        self._rerender_apps()
 
     def add_app(self):
         from tkinter import filedialog
@@ -2189,25 +2359,100 @@ class App:
                  "ok" if ok else "error")
         self.refresh_rules()
 
+    # ------------------------------------------------------ 批量进程操作
+
+    def _confirm(self, title, action, rows, extra=""):
+        if not rows:
+            messagebox.showinfo("提示", "请先选择程序（Ctrl / Shift 可多选）。")
+            return False
+        names = "\n".join("· %s（%d 个进程）" % (r.name, len(r.pids)) for r in rows[:15])
+        more = "\n…（共 %d 个程序）" % len(rows) if len(rows) > 15 else ""
+        return messagebox.askyesno(
+            title, "将%s以下 %d 个程序：\n\n%s%s%s\n\n未保存的数据会丢失，确定继续吗？"
+            % (action, len(rows), names, more, extra))
+
     def kill_app(self):
-        row = self._selected_app()
-        if not row:
-            messagebox.showinfo("提示", "请先选择一个程序。")
+        rows = self._selected_apps()
+        if not rows:
+            messagebox.showinfo("提示", "请先选择程序（Ctrl / Shift 可多选）。")
             return
-        name = row[2]
-        pids = row[5]
-        if not messagebox.askyesno("结束进程",
-                                   "确定结束「%s」（%d 个进程）吗？\n未保存的数据会丢失。"
-                                   % (name, len(pids))):
+        if not self._confirm("结束进程", "结束", rows):
             return
-        ok = 0
-        for pid in pids:
-            rc, out, err = run_cmd(["taskkill.exe", "/PID", str(pid), "/F"], timeout=30)
-            if rc == 0:
-                ok += 1
-            self.log("结束 PID %s：%s" % (pid, (out or err or "").strip()[:100]))
-        self.log("已结束 %d/%d 个进程。" % (ok, len(pids)), "ok" if ok else "error")
-        self.refresh_apps()
+        self._run(lambda: self._do_kill_rows(rows))
+
+    def _do_kill_rows(self, rows):
+        ok = total = 0
+        for r in rows:
+            for pid in r.pids:
+                total += 1
+                rc, out, err = run_cmd(["taskkill.exe", "/PID", str(pid), "/F"], timeout=30)
+                if rc == 0:
+                    ok += 1
+                self.log("结束 PID %s（%s）：%s"
+                         % (pid, r.name, (out or err or "").strip()[:80]))
+        self.log("已结束 %d/%d 个进程。" % (ok, total), "ok" if ok else "error")
+        self.ui(self.refresh_apps)
+
+    def restart_apps(self):
+        rows = self._selected_apps()
+        if not rows:
+            messagebox.showinfo("提示", "请先选择程序（Ctrl / Shift 可多选）。\n"
+                                        "小技巧：点「选中全部占用独显的」可一次选中所有独显程序。")
+            return
+        guard = [r for r in rows if r.name.lower() in PROTECTED_PROCS]
+        rows = [r for r in rows if r.name.lower() not in PROTECTED_PROCS]
+        if not rows:
+            messagebox.showinfo("提示", "所选都是系统关键进程，已跳过，不予重启。")
+            return
+        extra = ("\n\n⚠ 已跳过系统关键进程：%s" % "、".join(r.name for r in guard)) if guard else ""
+        if not self._confirm("重启程序", "结束并重新打开", rows, extra):
+            return
+        self._run(lambda: self._do_restart_rows(rows))
+
+    def _do_restart_rows(self, rows):
+        for r in rows:
+            for pid in r.pids:
+                run_cmd(["taskkill.exe", "/PID", str(pid), "/F"], timeout=20)
+            self.log("已结束「%s」的 %d 个进程，正在重新打开 …" % (r.name, len(r.pids)))
+            time.sleep(0.8)
+            try:
+                subprocess.Popen([r.path], cwd=os.path.dirname(r.path) or None)
+                self.log("已重新启动「%s」。新分配已生效。" % r.name, "ok")
+            except Exception:  # noqa: BLE001
+                self.log("重新启动「%s」失败：%s" % (r.name, traceback.format_exc(limit=2)),
+                         "error")
+        self.ui(self.refresh_apps)
+
+    def quick_release(self):
+        """一键：把所有正在用独显的程序改成集显并重启 —— 真正释放独显"""
+        rows = [r for r in self.proc_rows
+                if r.on_dgpu and r.name.lower() not in PROTECTED_PROCS]
+        if not rows:
+            messagebox.showinfo("一键释放独显",
+                                "当前没有检测到正在使用独显的程序，独显已经是空闲的。")
+            return
+        names = "\n".join("· %s  %s" % (r.name, r.usage) for r in rows[:15])
+        more = "\n…（共 %d 个程序）" % len(rows) if len(rows) > 15 else ""
+        if not messagebox.askyesno(
+                "一键释放独显",
+                "将把下面 %d 个正在使用独显的程序全部设为「节能（集显）」，"
+                "然后立即结束并重新打开它们：\n\n%s%s\n\n"
+                "未保存的数据会丢失，确定继续吗？" % (len(rows), names, more)):
+            return
+        self._run(lambda: self._do_release(rows))
+
+    def _do_release(self, rows):
+        n = 0
+        for r in rows:
+            ok, msg = gpu_pref_set(r.path, 1)
+            if ok:
+                n += 1
+            else:
+                self.log("设置「%s」失败：%s" % (r.name, msg), "error")
+        self.log("已把 %d / %d 个程序设为节能（集显），开始重启 …" % (n, len(rows)),
+                 "ok" if n else "error")
+        self._do_restart_rows(rows)
+        self.ui(self.refresh)
 
     # ---------------------------------------------------------- 线程执行器
 
@@ -2224,7 +2469,7 @@ class App:
                 self.log("内部错误: " + traceback.format_exc(limit=3), "error")
             finally:
                 self.busy = False
-                self.root.after(0, self.refresh)
+                self.ui(self.refresh)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -2297,7 +2542,7 @@ class App:
                 do_restart(5)
         else:
             self.log("部分设备未能禁用，可先到「应用分配」结束占用独显的程序再试。", "error")
-        self.root.after(0, self._sync_segment)
+        self.ui(self._sync_segment)
 
     def on_performance(self):
         if not self._ensure_admin():
@@ -2329,7 +2574,7 @@ class App:
                 do_restart(5)
         else:
             self.log("启用失败，请检查设备管理器。", "error")
-        self.root.after(0, self._sync_segment)
+        self.ui(self._sync_segment)
 
     def _selected(self):
         sel = self.tree.selection()
@@ -2411,7 +2656,7 @@ class App:
     def _monitor_loop(self):
         while not self.stop_monitor.is_set():
             stats = gpu_stats()
-            self.root.after(0, lambda s=stats: self._render_stats(s))
+            self.ui(self._render_stats, stats)
             time.sleep(2)
 
     def _render_stats(self, s):
